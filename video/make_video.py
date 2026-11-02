@@ -80,6 +80,7 @@ def main():
     p.add_argument("--gif", required=True)
     p.add_argument("--stage1", required=True)
     p.add_argument("--hack", required=True)
+    p.add_argument("--hop", required=True)
     p.add_argument("--out", required=True)
     args = p.parse_args()
 
@@ -92,7 +93,7 @@ def main():
             "Pollen Robotics の二足ロボット microduck（約 0.74 kg）",
             "Isaac Lab + Newton / MuJoCo Warp（シミュレーションのみ・実機なし）",
         ],
-        5,
+        6,
     )
 
     notes = [
@@ -143,7 +144,38 @@ def main():
         for f in video_frames(args.hack, stride=1, start=2.0, end=5.0)
     ]
 
-    out += card(args, "（続く）", ["上げた足で蹴らないよう報酬を改良して再学習中"], 3, title_color=FG)
+    notes = [
+        "報酬を改良して再学習",
+        "・上げた足が離陸 0.1 s 前から浮いている",
+        "  跳躍だけに報酬",
+        "・立ち続けると時間に比例して増える罰",
+        "・ケンケン中は静止を促す報酬を外す",
+        "",
+        "結果（128 回の評価）",
+        "・3 s で約 23 回ケンケン",
+        "・押し 0.15 m/s でも転倒 0%",
+        "・その後 2.5 s 片足で静止",
+        "・課題：上げた足の接地が 1 回ほど残る",
+    ]
+    header = "4. 報酬を改良 → 上げた足で蹴らずにケンケン"
+    out += [compose(args, f, header, notes + ["", "等倍"]) for f in video_frames(args.hop)]
+    out += [
+        compose(args, f, header, notes + ["", "ケンケン区間を 0.5 倍速で再生"])
+        for f in video_frames(args.hop, stride=1, start=2.0, end=5.0)
+    ]
+
+    out += card(
+        args,
+        "まとめ",
+        [
+            "物理モデルで可否を確認 → 先行研究をトレースして片足立ち",
+            "→ 報酬ハッキングを分析して報酬を改良 → 片足ケンケンを獲得",
+            "すべてシミュレーションのみ（Isaac Lab + Newton / MuJoCo Warp）",
+            "※ 0.5 倍速の区間は画面内に表記",
+        ],
+        9,
+        title_color=FG,
+    )
 
     writer = imageio.get_writer(args.out, fps=FPS, codec="libx264", quality=7, macro_block_size=8)
     for f in out:
