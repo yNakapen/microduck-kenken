@@ -1,0 +1,201 @@
+From 5424fef47930be3add02b12eb2d3f6607b29bbdc Mon Sep 17 00:00:00 2001
+From: Nakapen <nakapen@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 17:58:35 +0900
+Subject: [PATCH 05/19] #local update:name_microduck_rl_in_flamingo_docs
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+flamingo の静的確認まわりの docstring・コメント・レポート表記で、先行実装を「upstream」ではなく「microduck_rl」と名前で呼ぶように変更。動作の変更なし。
+---
+ .../microduck/check_flamingo_pose.py          | 26 +++++++++----------
+ .../contrib/microduck/flamingo_checks.py      |  8 +++---
+ .../contrib/microduck/flamingo_pose.py        | 12 ++++-----
+ .../test/test_microduck_flamingo.py           |  6 ++---
+ 4 files changed, 26 insertions(+), 26 deletions(-)
+
+diff --git a/scripts/reinforcement_learning/microduck/check_flamingo_pose.py b/scripts/reinforcement_learning/microduck/check_flamingo_pose.py
+index 836d98f05..507fa4ea8 100644
+--- a/scripts/reinforcement_learning/microduck/check_flamingo_pose.py
++++ b/scripts/reinforcement_learning/microduck/check_flamingo_pose.py
+@@ -3,11 +3,11 @@
+ #
+ # SPDX-License-Identifier: BSD-3-Clause
+ 
+-"""Check the upstream flamingo one-foot pose on the Newton MJWarp MicroDuck before training on it.
++"""Check microduck_rl's flamingo one-foot pose on the Newton MJWarp MicroDuck before training on it.
+ 
+ C1 (geometry, no physics step): for each stance side, place the robot with the stance sole flat and measure the
+-trunk lean, CoM margin inside the stance sole, lifted-foot clearance and joint-limit margins, next to the upstream
+-values and to the upstream trunk placement taken as is.
++trunk lean, CoM margin inside the stance sole, lifted-foot clearance and joint-limit margins, next to microduck_rl's
++values and to microduck_rl's trunk placement taken as is.
+ C2 (hold): from that placement, hold the pose's joint targets for ``--duration`` seconds and record when and which
+ way the robot falls; the default two-foot stance is run the same way for reference.
+ 
+@@ -55,10 +55,10 @@ from isaaclab_tasks.contrib.microduck.flamingo_pose import (
+ )
+ 
+ LIFTED_CLEARANCE_MIN = 0.05
+-"""Lowest lifted-sole height [m] that counts as clearly lifted (upstream: swing foot at least 5 cm up)."""
++"""Lowest lifted-sole height [m] that counts as clearly lifted (microduck_rl: swing foot at least 5 cm up)."""
+ 
+ JOINT_MARGIN_MIN = 0.05 - 1e-4
+-"""Joint-limit margin [rad] the pose must keep; 1e-4 rad covers upstream's rounded hip-roll range."""
++"""Joint-limit margin [rad] the pose must keep; 1e-4 rad covers microduck_rl's rounded hip-roll range."""
+ 
+ 
+ def _parse_args() -> argparse.Namespace:
+@@ -71,15 +71,15 @@ def _parse_args() -> argparse.Namespace:
+ 
+ 
+ def _geometry(env, pose: list[float], stance: str) -> dict:
+-    """C1 for one stance side: the flat-sole placement and the upstream placement taken as is."""
++    """C1 for one stance side: the flat-sole placement and microduck_rl's placement taken as is."""
+     sign = 1.0 if stance == "right" else -1.0
+     env.reset()
+     placement = solve_flat_sole_placement(env, pose, stance)
+     flat = measure_pose(env, pose, stance)
+     roll = torch.tensor([sign * FLAMINGO_BASE_ROLL], device=env.device)
+-    upstream_quat = quat_from_euler_xyz(roll, torch.tensor([FLAMINGO_BASE_PITCH], device=env.device), roll * 0.0)
+-    place_robot(env, pose, upstream_quat, FLAMINGO_Z)
+-    upstream = measure_pose(env, pose, stance)
++    microduck_rl_quat = quat_from_euler_xyz(roll, torch.tensor([FLAMINGO_BASE_PITCH], device=env.device), roll * 0.0)
++    place_robot(env, pose, microduck_rl_quat, FLAMINGO_Z)
++    microduck_rl = measure_pose(env, pose, stance)
+     checks = {
+         "stance sole flat (tilt < 0.5 deg, lowest point at 0 +- 0.1 mm)": flat.stance_sole_tilt_deg < 0.5
+         and abs(flat.stance_sole_min_z) < 1e-4,
+@@ -87,7 +87,7 @@ def _geometry(env, pose: list[float], stance: str) -> dict:
+         f"lifted sole >= {LIFTED_CLEARANCE_MIN * 100:.0f} cm up": flat.lifted_sole_min_z >= LIFTED_CLEARANCE_MIN,
+         "every joint >= 0.05 rad off its limit (1e-4 rad rounding)": flat.min_joint_limit_margin >= JOINT_MARGIN_MIN,
+     }
+-    return {"stance": stance, "placement": placement, "flat": flat, "upstream": upstream, "checks": checks}
++    return {"stance": stance, "placement": placement, "flat": flat, "microduck_rl": microduck_rl, "checks": checks}
+ 
+ 
+ def _hold(env, pose: list[float], stance: str, duration: float, label: str, rows: list[dict]) -> dict:
+@@ -163,10 +163,10 @@ def _report(args, geometry: list[dict], holds: list[dict]) -> list[str]:
+         "",
+     ]
+     for g in geometry:
+-        flat, up = g["flat"], g["upstream"]
++        flat, up = g["flat"], g["microduck_rl"]
+         sign = 1.0 if g["stance"] == "right" else -1.0
+         gravity = (FLAMINGO_GRAVITY_B[0], sign * FLAMINGO_GRAVITY_B[1], FLAMINGO_GRAVITY_B[2])
+-        # (quantity, upstream value, value under the upstream placement, value under the flat-sole placement)
++        # (quantity, microduck_rl value, value under microduck_rl's placement, value under the flat-sole placement)
+         rows = [
+             ("trunk roll [deg]", f"{sign * math.degrees(FLAMINGO_BASE_ROLL):.1f}", f"{up.roll_deg:.1f}",
+              f"{flat.roll_deg:.2f}"),
+@@ -191,7 +191,7 @@ def _report(args, geometry: list[dict], holds: list[dict]) -> list[str]:
+         lines += [
+             f"### {g['stance']} stance",
+             "",
+-            "| quantity | upstream value | upstream placement here | flat-sole placement here |",
++            "| quantity | microduck_rl value | microduck_rl placement here | flat-sole placement here |",
+             "|---|---|---|---|",
+             *["| " + " | ".join(row) + " |" for row in rows],
+             "",
+diff --git a/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_checks.py b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_checks.py
+index f4ae8045d..69311d415 100644
+--- a/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_checks.py
++++ b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_checks.py
+@@ -3,12 +3,12 @@
+ #
+ # SPDX-License-Identifier: BSD-3-Clause
+ 
+-"""Static checks of the upstream flamingo pose on the Newton MJWarp MicroDuck.
++"""Static checks of microduck_rl's flamingo pose on the Newton MJWarp MicroDuck.
+ 
+ :func:`make_check_env` builds the all-collisions robot without gearbox play, randomization or pushes.
+ :func:`solve_flat_sole_placement` finds the trunk roll, pitch and height that put a stance sole flat on the floor
+ for a given joint pose, :func:`place_robot` teleports the robot there, and :func:`measure_pose` reports the quantities
+-the upstream design validated the pose with. Support hulls come from the sole collision meshes of the robot USD.
++microduck_rl's design validated the pose with. Support hulls come from the sole collision meshes of the robot USD.
+ """
+ 
+ from __future__ import annotations
+@@ -61,7 +61,7 @@ def make_check_env(device: str = "cuda:0", num_envs: int = 1, vin: float = 7.4)
+ 
+     cfg = parse_env_cfg(CHECK_TASK, device=device, num_envs=num_envs)
+     cfg.scene.robot = MICRODUCK_ALLCOLLISIONS_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
+-    # Upstream mjlab uses MuJoCo Warp's own collision detection instead of Newton's pipeline.
++    # microduck_rl on mjlab uses MuJoCo Warp's own collision detection instead of Newton's pipeline.
+     cfg.sim.physics.solver_cfg.use_mujoco_contacts = True
+     cfg.sim.physics.collision_cfg = None
+     for name in _RANDOMIZATION_EVENTS:
+@@ -232,7 +232,7 @@ def solve_flat_sole_placement(env: ManagerBasedRLEnv, pose: list[float], stance:
+ 
+ @dataclass
+ class PoseMeasurement:
+-    """Geometry of environment 0 standing on one foot, as validated upstream."""
++    """Geometry of environment 0 standing on one foot, as validated in microduck_rl."""
+ 
+     roll_deg: float
+     pitch_deg: float
+diff --git a/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_pose.py b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_pose.py
+index 2927fc97e..1e1bb1beb 100644
+--- a/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_pose.py
++++ b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_pose.py
+@@ -6,7 +6,7 @@
+ """The one-foot "flamingo" pose of pollen-robotics/microduck_rl, reproduced on Newton MJWarp.
+ 
+ Values are copied from ``src/mjlab_microduck/tasks/microduck_flamingo_env_cfg.py`` and
+-``docs/superpowers/specs/2026-08-28-flamingo-design.md`` on the upstream ``flamingo`` branch (``4757d6ae``).
++``docs/superpowers/specs/2026-08-28-flamingo-design.md`` on the microduck_rl ``flamingo`` branch (``4757d6ae``).
+ Joint values follow :data:`~isaaclab_assets.robots.microduck.MICRODUCK_JOINT_NAMES`: left leg, neck and head,
+ right leg.
+ """
+@@ -21,19 +21,19 @@ FLAMINGO_POSE_RIGHT: list[float] = [
+ """Joint positions [rad] of the pose standing on the right foot, every joint at least 3 deg inside its range."""
+ 
+ FLAMINGO_BASE_ROLL = math.radians(22.6)
+-"""Upstream trunk roll [rad] with the right sole flat on the floor."""
++"""microduck_rl's trunk roll [rad] with the right sole flat on the floor."""
+ 
+ FLAMINGO_BASE_PITCH = math.radians(-8.9)
+-"""Upstream trunk pitch [rad] with the right sole flat on the floor."""
++"""microduck_rl's trunk pitch [rad] with the right sole flat on the floor."""
+ 
+ FLAMINGO_Z = 0.120
+-"""Upstream trunk height [m] with the right sole flat on the floor."""
++"""microduck_rl's trunk height [m] with the right sole flat on the floor."""
+ 
+ FLAMINGO_GRAVITY_B = (-0.154, -0.379, -0.912)
+-"""Upstream gravity direction in the trunk frame at the right-stance pose."""
++"""microduck_rl's gravity direction in the trunk frame at the right-stance pose."""
+ 
+ FLAMINGO_COM_MARGIN = 0.0121
+-"""Upstream distance [m] of the whole-robot CoM inside the stance sole's contact hull."""
++"""microduck_rl's distance [m] of the whole-robot CoM inside the stance sole's contact hull."""
+ 
+ 
+ def mirror_pose(pose: list[float]) -> list[float]:
+diff --git a/source/isaaclab_tasks/test/test_microduck_flamingo.py b/source/isaaclab_tasks/test/test_microduck_flamingo.py
+index b3886b6bb..3e98b5daf 100644
+--- a/source/isaaclab_tasks/test/test_microduck_flamingo.py
++++ b/source/isaaclab_tasks/test/test_microduck_flamingo.py
+@@ -73,7 +73,7 @@ def test_check_env_uses_the_all_collisions_robot_without_backlash(check_env):
+     assert check_env.cfg.scene.robot.spawn.usd_path.endswith("microduck_allcollisions.usd")
+     assert not any(name.startswith("passive_") for name in robot.joint_names)
+     assert check_env.cfg.events.push_robot is None
+-    # Upstream mjlab runs MuJoCo Warp's own collision detection; so does the check.
++    # microduck_rl on mjlab runs MuJoCo Warp's own collision detection; so does the check.
+     assert check_env.cfg.sim.physics.solver_cfg.use_mujoco_contacts
+     assert check_env.cfg.sim.physics.collision_cfg is None
+ 
+@@ -125,8 +125,8 @@ def test_flat_sole_placement_puts_the_stance_sole_on_the_ground(check_env, stanc
+     assert measured.stance_sole_min_z == pytest.approx(0.0, abs=1e-4)
+     assert measured.stance_sole_tilt_deg < 0.5
+     assert measured.lifted_sole_min_z > 0.03
+-    # The pose stays 0.05 rad off every hard limit (upstream test plan). Upstream checks against ranges rounded to
+-    # 0.384 rad; the 22 deg hip-roll limit leaves 0.04997 rad, so the comparison allows 1e-4 rad of rounding.
++    # The pose stays 0.05 rad off every hard limit (microduck_rl test plan). microduck_rl checks against ranges
++    # rounded to 0.384 rad; the 22 deg hip-roll limit leaves 0.04997 rad, so the comparison allows 1e-4 rad of rounding.
+     assert measured.min_joint_limit_margin >= 0.05 - 1e-4
+     # Leaning over the stance foot rolls the trunk toward it.
+     assert math.copysign(1.0, measured.roll_deg) == (1.0 if stance == "right" else -1.0)
+-- 
+2.43.0
+

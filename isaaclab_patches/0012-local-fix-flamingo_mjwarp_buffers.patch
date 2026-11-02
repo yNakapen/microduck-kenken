@@ -1,0 +1,47 @@
+From c461c5dc5ece1ecfa52462245262216f9fbf71d5 Mon Sep 17 00:00:00 2001
+From: Nakapen <nakapen@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 00:33:39 +0900
+Subject: [PATCH 12/19] #local fix:flamingo_mjwarp_buffers
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+flamingo 系の環境の MJWarp のバッファを、microduck_rl（mjlab の速度追従環境の既定値）と同じ njmax=1500、nconmax=35 にする。歩行タスクの njmax=96 は足裏だけの衝突向けで、全身衝突では制約行数があふれていた（学習ログに nefc overflow が段階 1 で 291 / 661 回、Cycle で 1239 回）。修正後の 20 it の学習で警告 0 回。
+---
+ .../isaaclab_tasks/contrib/microduck/flamingo_env_cfg.py      | 4 ++++
+ source/isaaclab_tasks/test/test_microduck_flamingo_env.py     | 4 ++++
+ 2 files changed, 8 insertions(+)
+
+diff --git a/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_env_cfg.py b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_env_cfg.py
+index d3da8195a..163286943 100644
+--- a/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_env_cfg.py
++++ b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_env_cfg.py
+@@ -205,6 +205,10 @@ class MicroDuckFlamingoFlatEnvCfg(MicroDuckVelocityFlatEnvCfg):
+         # microduck_rl runs MuJoCo Warp's own collision detection instead of Newton's pipeline.
+         self.sim.physics.solver_cfg.use_mujoco_contacts = True
+         self.sim.physics.collision_cfg = None
++        # mjlab's velocity-env defaults, which microduck_rl's flamingo keeps. The walking task's njmax=96 is sized for
++        # sole-only collisions and overflows the constraint rows of whole-body contacts.
++        self.sim.physics.solver_cfg.njmax = 1500
++        self.sim.physics.solver_cfg.nconmax = 35
+ 
+     def play_mode(self):
+         """Disable interval pushes together with their magnitude schedule."""
+diff --git a/source/isaaclab_tasks/test/test_microduck_flamingo_env.py b/source/isaaclab_tasks/test/test_microduck_flamingo_env.py
+index 372d5e881..c42a00454 100644
+--- a/source/isaaclab_tasks/test/test_microduck_flamingo_env.py
++++ b/source/isaaclab_tasks/test/test_microduck_flamingo_env.py
+@@ -164,6 +164,10 @@ def test_flamingo_runs_the_all_collisions_robot_like_microduck_rl(flamingo_env):
+     assert not any(name.startswith("passive_") for name in robot.joint_names)
+     assert env.cfg.sim.physics.solver_cfg.use_mujoco_contacts
+     assert env.cfg.sim.physics.collision_cfg is None
++    # mjlab's velocity-env buffers, which microduck_rl's flamingo keeps: the walking task's njmax=96 overflows with
++    # whole-body contacts.
++    assert env.cfg.sim.physics.solver_cfg.njmax == 1500
++    assert env.cfg.sim.physics.solver_cfg.nconmax == 35
+     # microduck_rl comments out the BAM current limit; zero disables it.
+     assert env.cfg.scene.robot.actuators["servos"].motor.max_current == 0.0
+     # Self-collisions are watched over the whole body, as microduck_rl's trunk_base subtree sensor.
+-- 
+2.43.0
+

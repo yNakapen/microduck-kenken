@@ -1,0 +1,128 @@
+From b7a9908ba8100c346868e3ed78cd07aab7ef1170 Mon Sep 17 00:00:00 2001
+From: Nakapen <nakapen@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 22:22:39 +0900
+Subject: [PATCH 08/19] #local update:flamingo_stage1_cycle_fixes
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+microduck_rl が Cycle 版で入れた段階 1 の修正を、flamingo 段階 1 に反映する。
+- 左足 site の高さの目標: 0.05 ± 0.03 → 0.10 ± 0.06 m（c008a7f3: 姿勢の 0.17 m と矛盾）
+- 押しの上限: 0.25 → 0.15 m/s（600 it で到達）
+- action_rate の上限: -1.0 → -0.5（400 it で到達）
+  （e4a3ca5f: 段階 1 の長時間学習が 0.25 m/s と -1.0 の重なりで報酬半減・回復せず。
+   本環境の初回学習でも 1000 it で報酬 43.6 → 25.1 と同じ崩れ方をした）
+---
+ .../changelog.d/hop-local-hop-task.added.rst  |  3 ++-
+ .../contrib/microduck/flamingo_env_cfg.py     | 21 ++++++++++++-------
+ .../test/test_microduck_flamingo_env.py       | 11 ++++++----
+ 3 files changed, 23 insertions(+), 12 deletions(-)
+
+diff --git a/source/isaaclab_tasks/changelog.d/hop-local-hop-task.added.rst b/source/isaaclab_tasks/changelog.d/hop-local-hop-task.added.rst
+index fed0efd8a..f8e31267d 100644
+--- a/source/isaaclab_tasks/changelog.d/hop-local-hop-task.added.rst
++++ b/source/isaaclab_tasks/changelog.d/hop-local-hop-task.added.rst
+@@ -11,7 +11,8 @@
+   margin, foot clearance and joint-limit margins on the all-collisions robot with MuJoCo Warp contacts.
+ * Added ``IsaacContrib-Flamingo-Flat-MicroDuck``, a port of microduck_rl's stage-1 one-foot balance
+   (``Mjlab-Flamingo-Flat-MicroDuck``) that spawns in the noised flamingo pose on the all-collisions robot with
+-  MuJoCo Warp contacts and no BAM current limit, with the ``com_over_foot``, ``foot_in_contact``,
++  MuJoCo Warp contacts and no BAM current limit, with the swing-foot clearance target and the push and action-rate
++  caps of microduck_rl's Cycle task, and with the ``com_over_foot``, ``foot_in_contact``,
+   ``foot_site_height_gaussian``, ``projected_gravity_match``, ``lateral_tilt_cost``, ``joint_vel_gaussian``,
+   ``pose_target_match``, ``joint_limit_proximity`` and ``joint_torque_rate_l2`` MicroDuck reward terms and the
+   ``reset_flamingo_pose`` event.
+diff --git a/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_env_cfg.py b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_env_cfg.py
+index e28d9c395..d3da8195a 100644
+--- a/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_env_cfg.py
++++ b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_env_cfg.py
+@@ -10,6 +10,10 @@ microduck_rl ``flamingo`` branch, ``4757d6ae``). The robot spawns in the noised
+ command and must hold it under growing pushes. Like microduck_rl it runs the all-collisions robot without gearbox
+ play, MuJoCo Warp's own contacts and no BAM current limit; it keeps the walking task's 61-wide actor input,
+ randomization and terminations.
++
++It carries the stage-1 fixes microduck_rl made in its Cycle task: the swing-foot clearance target 0.10 +- 0.06 m
++instead of 0.05 +- 0.03 m (``c008a7f3``), and pushes capped at 0.15 m/s with the action-rate weight capped at -0.5
++(``e4a3ca5f``), because the 0.25 m/s stage on top of the -1.0 weight halved the stage-1 reward for good.
+ """
+ 
+ import math
+@@ -50,8 +54,12 @@ _SWING_SENSOR_CFG = SceneEntityCfg("contact_forces", body_names=["ankle_left"])
+ 
+ FLAMINGO_STANCE_SIDE_TILT = 0.45
+ """Trunk-frame gravity ``-g_b,y`` beyond which the trunk rolls further toward the stance side than the pose (0.38)."""
+-FLAMINGO_SWING_FOOT_TARGET_Z = 0.05
+-"""microduck_rl's stage-1 swing-foot site height target [m]; the pose itself holds the site at about 0.17 m."""
++FLAMINGO_SWING_FOOT_TARGET_Z = 0.10
++"""Swing-foot site height target [m] of microduck_rl's Cycle task; its stage-1 0.05 m contradicted the pose's 0.17 m."""
++FLAMINGO_SWING_FOOT_STD = 0.06
++"""Swing-foot height tolerance [m]: pays 0.5 at 5 cm, 1.0 at 10 cm and 0.26 at the pose's 17 cm."""
++FLAMINGO_MAX_PUSH = 0.15
++"""Final push magnitude [m/s]; microduck_rl's stage-1 run collapsed at its 0.25 m/s stage."""
+ 
+ 
+ @configclass
+@@ -100,7 +108,7 @@ class FlamingoRewardsCfg:
+         weight=1.5,
+         params={
+             "target": FLAMINGO_SWING_FOOT_TARGET_Z,
+-            "std": 0.03,
++            "std": FLAMINGO_SWING_FOOT_STD,
+             "asset_cfg": _SWING_FOOT_CFG,
+             "gate_sensor_cfg": _STANCE_SENSOR_CFG,
+         },
+@@ -165,17 +173,16 @@ class FlamingoEventsCfg(EventsCfg):
+ 
+ @configclass
+ class FlamingoCurriculumCfg(CurriculumCfg):
+-    """microduck_rl's stage-1 schedules, in its iterations; the CoM randomization ramps as in walking."""
++    """microduck_rl's stage-1 schedules in its iterations, with pushes and action-rate capped as in its Cycle task."""
+ 
+     head_pose_bias_weight = None
+     standing_envs = None
+     head_pose_range = None
+-    action_rate_weight = _schedule("rewards.action_rate_l2.weight", (400, -0.5), (800, -1.0))
++    action_rate_weight = _schedule("rewards.action_rate_l2.weight", (400, -0.5))
+     push_magnitude = _schedule(
+         "events.push_robot.params.velocity_range",
+         (300, {"x": (-0.08, 0.08), "y": (-0.08, 0.08)}),
+-        (600, {"x": (-0.15, 0.15), "y": (-0.15, 0.15)}),
+-        (1000, {"x": (-0.25, 0.25), "y": (-0.25, 0.25)}),
++        (600, {"x": (-FLAMINGO_MAX_PUSH, FLAMINGO_MAX_PUSH), "y": (-FLAMINGO_MAX_PUSH, FLAMINGO_MAX_PUSH)}),
+     )
+     torque_rate_weight = _schedule("rewards.joint_torque_rate_l2.weight", (600, -1e-3))
+     com_std = _schedule("rewards.com_over_stance_foot.params.std", (500, 0.02))
+diff --git a/source/isaaclab_tasks/test/test_microduck_flamingo_env.py b/source/isaaclab_tasks/test/test_microduck_flamingo_env.py
+index e71c227fe..372d5e881 100644
+--- a/source/isaaclab_tasks/test/test_microduck_flamingo_env.py
++++ b/source/isaaclab_tasks/test/test_microduck_flamingo_env.py
+@@ -196,7 +196,9 @@ def test_flamingo_rewards_match_microduck_rl_stage_one(flamingo_env):
+     weights = {name: manager.get_term_cfg(name).weight for name in manager.active_terms}
+     assert weights == pytest.approx(expected)
+     assert manager.get_term_cfg("com_over_stance_foot").params["std"] == 0.03
+-    assert manager.get_term_cfg("swing_foot_clear").params["target"] == 0.05
++    # microduck_rl's Cycle fix (c008a7f3): 0.05 +- 0.03 contradicted the pose's 0.17 m foot.
++    assert manager.get_term_cfg("swing_foot_clear").params["target"] == 0.10
++    assert manager.get_term_cfg("swing_foot_clear").params["std"] == 0.06
+ 
+ 
+ @pytest.mark.integration
+@@ -242,11 +244,12 @@ def test_flamingo_curriculum_reaches_the_final_microduck_rl_stages(flamingo_env)
+     try:
+         env.common_step_counter = 1500 * 24
+         env.curriculum_manager.compute(env_ids=torch.arange(env.num_envs, device=env.device))
++        # microduck_rl's Cycle fix (e4a3ca5f): the 0.25 m/s push on top of the -1.0 action-rate tax collapsed stage 1.
+         assert env.event_manager.get_term_cfg("push_robot").params["velocity_range"] == {
+-            "x": (-0.25, 0.25),
+-            "y": (-0.25, 0.25),
++            "x": (-0.15, 0.15),
++            "y": (-0.15, 0.15),
+         }
+-        assert env.reward_manager.get_term_cfg("action_rate_l2").weight == -1.0
++        assert env.reward_manager.get_term_cfg("action_rate_l2").weight == -0.5
+         assert env.reward_manager.get_term_cfg("joint_torque_rate_l2").weight == -1e-3
+         assert env.reward_manager.get_term_cfg("com_over_stance_foot").params["std"] == 0.02
+         assert env.event_manager.get_term_cfg("randomize_com").params["com_range"]["x"] == (-0.015, 0.015)
+-- 
+2.43.0
+

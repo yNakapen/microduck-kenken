@@ -1,0 +1,115 @@
+From d0bfb65d88b5fc083e556fc83dad93476e56e51f Mon Sep 17 00:00:00 2001
+From: Nakapen <nakapen@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 07:58:09 +0900
+Subject: [PATCH 16/19] #local
+ update:hop_reward_needs_swing_foot_up_before_takeoff
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+ケンケンの跳躍報酬を、上げた足が離陸の 0.1 s 前から着地まで浮いている跳躍だけに与える（swing_lead_time=0.1）。前回の条件（上げた足の空中時間 >= 立ち足の滞空時間）は両足で同時に踏み切るとすり抜けた。初回モデル（4998 it）では離陸の直前 60 ms に上げた足が接地していた割合が 93%、着地の直後 60 ms は 1% で、上げた足で床を蹴って跳んでいた。
+---
+ .../contrib/microduck/flamingo_hop_env_cfg.py |  6 +++--
+ .../contrib/microduck/mdp/flamingo_hop.py     |  7 +++---
+ .../test/test_microduck_flamingo_hop.py       | 23 +++++++++++++++++++
+ 3 files changed, 31 insertions(+), 5 deletions(-)
+
+diff --git a/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_hop_env_cfg.py b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_hop_env_cfg.py
+index b64741670..efd793893 100644
+--- a/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_hop_env_cfg.py
++++ b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_hop_env_cfg.py
+@@ -7,7 +7,7 @@
+ 
+ Fine-tunes the flamingo stage-1 policy: the robot spawns in the one-foot pose, and the twist slots carry
+ ``[0, 0, hop]`` from :class:`~isaaclab_tasks.contrib.microduck.mdp.HopCommand`, alternating a still stand and hopping.
+-While hopping the stance foot must leave the floor and land again with the lifted foot still up (40 to 120 ms
++While hopping the stance foot must leave the floor and land again with the lifted foot up from before the takeoff (40 to 120 ms
+ flights are paid), may not stay
+ down longer than 0.4 s, and the trunk must stay in place; the still-stand terms fade out over the 0.3 s blend and back.
+ The stage-1 schedules start at their final values, with 0.15 m/s pushes throughout.
+@@ -57,8 +57,10 @@ class FlamingoHopRewardsCfg(FlamingoRewardsCfg):
+             "sensor_cfg": _STANCE_SENSOR_CFG,
+             "min_air_time": FLAMINGO_HOP_MIN_AIR_TIME,
+             "max_air_time": FLAMINGO_HOP_MAX_AIR_TIME,
+-            # Without it the first policy landed every hop on both feet.
++            # The swing foot must be up from 0.1 s before the takeoff to the landing: the first policy pushed off with
++            # it within 60 ms before 93 % of its takeoffs.
+             "swing_sensor_cfg": _SWING_SENSOR_CFG,
++            "swing_lead_time": 0.1,
+         },
+     )
+     hop_ground_time = RewTerm(
+diff --git a/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/mdp/flamingo_hop.py b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/mdp/flamingo_hop.py
+index b474aa4eb..ccf613bbc 100644
+--- a/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/mdp/flamingo_hop.py
++++ b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/mdp/flamingo_hop.py
+@@ -112,13 +112,14 @@ def hop_air_time(
+     min_air_time: float,
+     max_air_time: float,
+     swing_sensor_cfg: SceneEntityCfg | None = None,
++    swing_lead_time: float = 0.0,
+ ) -> torch.Tensor:
+     """Score in [0, 1] of the stance foot's flight ending this step while hopping: 0 at ``min_air_time`` [s] or
+     shorter, 1 at ``max_air_time`` [s] or longer. Only flights of the stance foot count, so a tapping swing foot earns
+     nothing.
+ 
+-    With ``swing_sensor_cfg``, a landing pays only when the swing foot has been in the air at least as long as the
+-    stance flight, i.e. it stayed up through the flight and the landing instead of landing on both feet.
++    With ``swing_sensor_cfg``, a landing pays only when the swing foot has been in the air at least the stance flight
++    plus ``swing_lead_time`` [s]: it was up before the takeoff, so it did not push off, and stayed up to the landing.
+     """
+     sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+     landed = sensor.compute_first_contact(env.step_dt).torch[:, sensor_cfg.body_ids].any(dim=1).float()
+@@ -127,7 +128,7 @@ def hop_air_time(
+     if swing_sensor_cfg is not None:
+         swing_sensor: ContactSensor = env.scene.sensors[swing_sensor_cfg.name]
+         swing_air = zero_non_finite(swing_sensor.data.current_air_time.torch[:, swing_sensor_cfg.body_ids])
+-        score = score * (swing_air.min(dim=1).values >= air - 1e-6).float()
++        score = score * (swing_air.min(dim=1).values >= air + swing_lead_time - 1e-6).float()
+     return _beta(env, command_name) * landed * score
+ 
+ 
+diff --git a/source/isaaclab_tasks/test/test_microduck_flamingo_hop.py b/source/isaaclab_tasks/test/test_microduck_flamingo_hop.py
+index f7544fd03..b8cce55b2 100644
+--- a/source/isaaclab_tasks/test/test_microduck_flamingo_hop.py
++++ b/source/isaaclab_tasks/test/test_microduck_flamingo_hop.py
+@@ -94,6 +94,27 @@ _STANCE = SceneEntityCfg("contact_forces", body_ids=[0])
+ _SWING = SceneEntityCfg("contact_forces", body_ids=[1])
+ 
+ 
++def test_hop_air_time_refuses_takeoffs_pushed_with_the_swing_foot():
++    # 80 ms stance flights; the swing foot left the floor with the stance foot (both feet pushed off), 50 ms before
++    # the takeoff, and 0.1 s or more before it.
++    env = _fake_env(
++        beta=[1.0, 1.0, 1.0, 1.0],
++        first_contact=[[True, False]] * 4,
++        last_air_time=[[0.08, 0.0]] * 4,
++        current_air_time=[[0.0, 0.08], [0.0, 0.13], [0.0, 0.18], [0.0, 1.0]],
++    )
++    reward = mdp.hop_air_time(
++        env,
++        "base_velocity",
++        _STANCE,
++        min_air_time=0.04,
++        max_air_time=0.12,
++        swing_sensor_cfg=_SWING,
++        swing_lead_time=0.1,
++    )
++    torch.testing.assert_close(reward, torch.tensor([0.0, 0.0, 0.5, 0.5]))
++
++
+ def test_hop_air_time_pays_only_landings_with_the_swing_foot_up_through_the_flight():
+     # Columns [stance, swing]; every row lands after an 80 ms stance flight while hopping. The swing foot has been up
+     # for 1 s, down now, up for only 40 ms (it touched during the flight), and up for exactly the flight.
+@@ -198,6 +219,8 @@ def test_hop_rewards(hop_env):
+     assert manager.get_term_cfg("com_over_stance_foot").params["std"] == 0.02
+     # Hops landing on both feet earn nothing.
+     assert manager.get_term_cfg("hop_air_time").params["swing_sensor_cfg"].body_names == ["ankle_left"]
++    # The swing foot must be up 0.1 s before the takeoff: the first policy pushed off with it 93 % of the time.
++    assert manager.get_term_cfg("hop_air_time").params["swing_lead_time"] == 0.1
+ 
+ 
+ @pytest.mark.integration
+-- 
+2.43.0
+

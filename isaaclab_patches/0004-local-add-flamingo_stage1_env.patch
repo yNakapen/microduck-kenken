@@ -1,0 +1,821 @@
+From 5a229b6684c53549dea8d98b547828bc88707d41 Mon Sep 17 00:00:00 2001
+From: Nakapen <nakapen@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 17:56:14 +0900
+Subject: [PATCH 04/19] #local add:flamingo_stage1_env
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+microduck_rl の flamingo 段階 1（Mjlab-Flamingo-Flat-MicroDuck、flamingo ブランチ 4757d6ae）を
+Newton MJWarp 上に移植した IsaacContrib-Flamingo-Flat-MicroDuck を追加。
+
+- 出現: 片足姿勢（ロール 22.6°・ピッチ -8.9°・z 0.120-0.130、±3°・関節 σ0.05、ヨー一様、xy ±0.5 m）
+- 報酬: microduck_rl 段階 1 の 14 項（非正の項は Isaac Lab の cost 規約で負の重み）
+- カリキュラム: 押し 0→0.08→0.15→0.25、action_rate、torque_rate、重心 std、CoM DR
+- ロボット: allcollisions・バックラッシュなし・MuJoCo Warp 接触・BAM 電流制限なし、自己衝突は全身
+- 指令: twist ±0.01/±0.05 を 6-12 s で再サンプル、body 指令 0、critic の foot_height なし
+- PPO: 歩行と同じ設定で 3000 it
+---
+ .../changelog.d/hop-local-hop-task.added.rst  |   8 +-
+ .../contrib/microduck/__init__.py             |  12 +-
+ .../microduck/agents/rsl_rl_ppo_cfg.py        |   9 +
+ .../contrib/microduck/flamingo_env_cfg.py     | 200 +++++++++++++++
+ .../contrib/microduck/mdp/__init__.pyi        |  26 +-
+ .../contrib/microduck/mdp/flamingo.py         | 196 +++++++++++++-
+ .../test/test_microduck_flamingo_env.py       | 241 ++++++++++++++++++
+ 7 files changed, 687 insertions(+), 5 deletions(-)
+ create mode 100644 source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_env_cfg.py
+ create mode 100644 source/isaaclab_tasks/test/test_microduck_flamingo_env.py
+
+diff --git a/source/isaaclab_tasks/changelog.d/hop-local-hop-task.added.rst b/source/isaaclab_tasks/changelog.d/hop-local-hop-task.added.rst
+index 0b8fa0c2b..a05299f54 100644
+--- a/source/isaaclab_tasks/changelog.d/hop-local-hop-task.added.rst
++++ b/source/isaaclab_tasks/changelog.d/hop-local-hop-task.added.rst
+@@ -4,8 +4,14 @@
+ * Added :mod:`isaaclab_tasks.contrib.microduck.hop_metrics` and ``scripts/reinforcement_learning/microduck/eval_hop.py``
+   to evaluate exported MicroDuck single-leg policies on Newton MJWarp at fixed BAM supply voltages, reporting falls,
+   hops, flight time, centre-of-mass rise, torque saturation and the test-plan verdict per voltage.
+-* Added the upstream MicroDuck one-foot "flamingo" pose in :mod:`isaaclab_tasks.contrib.microduck.flamingo_pose`,
++* Added microduck_rl's MicroDuck one-foot "flamingo" pose in :mod:`isaaclab_tasks.contrib.microduck.flamingo_pose`,
+   the ``robot_com_pos_w`` and ``foot_site_pos_w`` MicroDuck measurements, and
+   :mod:`isaaclab_tasks.contrib.microduck.flamingo_checks` with
+   ``scripts/reinforcement_learning/microduck/check_flamingo_pose.py`` to check the pose's sole placement, centre-of-mass
+   margin, foot clearance and joint-limit margins on the all-collisions robot with MuJoCo Warp contacts.
++* Added ``IsaacContrib-Flamingo-Flat-MicroDuck``, a port of microduck_rl's stage-1 one-foot balance
++  (``Mjlab-Flamingo-Flat-MicroDuck``) that spawns in the noised flamingo pose on the all-collisions robot with
++  MuJoCo Warp contacts and no BAM current limit, with the ``com_over_foot``, ``foot_in_contact``,
++  ``foot_site_height_gaussian``, ``projected_gravity_match``, ``lateral_tilt_cost``, ``joint_vel_gaussian``,
++  ``pose_target_match``, ``joint_limit_proximity`` and ``joint_torque_rate_l2`` MicroDuck reward terms and the
++  ``reset_flamingo_pose`` event.
+diff --git a/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/__init__.py b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/__init__.py
+index ae8a68067..92b6831d3 100644
+--- a/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/__init__.py
++++ b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/__init__.py
+@@ -3,7 +3,7 @@
+ #
+ # SPDX-License-Identifier: BSD-3-Clause
+ 
+-"""MicroDuck flat and rough velocity walking, and the single-leg stand towards hopping.
++"""MicroDuck flat and rough velocity walking, the single-leg stand towards hopping, and one-foot flamingo balance.
+ 
+ Select the backlash robot with ``presets=backlash``.
+ """
+@@ -30,6 +30,16 @@ gym.register(
+     },
+ )
+ 
++gym.register(
++    id="IsaacContrib-Flamingo-Flat-MicroDuck",
++    entry_point="isaaclab.envs:ManagerBasedRLEnv",
++    disable_env_checker=True,
++    kwargs={
++        "env_cfg_entry_point": f"{__name__}.flamingo_env_cfg:MicroDuckFlamingoFlatEnvCfg",
++        "rsl_rl_cfg_entry_point": f"{__name__}.agents.rsl_rl_ppo_cfg:MicroDuckFlamingoPPORunnerCfg",
++    },
++)
++
+ gym.register(
+     id="IsaacContrib-Velocity-Rough-MicroDuck",
+     entry_point="isaaclab.envs:ManagerBasedRLEnv",
+diff --git a/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/agents/rsl_rl_ppo_cfg.py b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/agents/rsl_rl_ppo_cfg.py
+index 2df98efc9..0c4138837 100644
+--- a/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/agents/rsl_rl_ppo_cfg.py
++++ b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/agents/rsl_rl_ppo_cfg.py
+@@ -55,6 +55,15 @@ class MicroDuckHopStandPPORunnerCfg(MicroDuckPPORunnerCfg):
+     experiment_name = preset(default="microduck_hop_stand_flat", backlash="microduck_hop_stand_flat_backlash")
+ 
+ 
++@configclass
++class MicroDuckFlamingoPPORunnerCfg(MicroDuckPPORunnerCfg):
++    """The walking PPO recipe, which microduck_rl's flamingo shares, with its 3000-iteration budget."""
++
++    max_iterations = 3000
++    save_interval = 100
++    experiment_name = "microduck_flamingo_flat"
++
++
+ @configclass
+ class MicroDuckRoughPPORunnerCfg(MicroDuckPPORunnerCfg):
+     """The same PPO recipe with a separate experiment directory for rough terrain."""
+diff --git a/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_env_cfg.py b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_env_cfg.py
+new file mode 100644
+index 000000000..229fdaa1b
+--- /dev/null
++++ b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_env_cfg.py
+@@ -0,0 +1,200 @@
++# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
++# All rights reserved.
++#
++# SPDX-License-Identifier: BSD-3-Clause
++
++"""One-foot "flamingo" balance on the right foot, microduck_rl's stage 1 on Newton MJWarp.
++
++A port of ``Mjlab-Flamingo-Flat-MicroDuck`` (``src/mjlab_microduck/tasks/microduck_flamingo_env_cfg.py`` on the
++microduck_rl ``flamingo`` branch, ``4757d6ae``). The robot spawns in the noised one-foot pose with a near-zero
++command and must hold it under growing pushes. Like microduck_rl it runs the all-collisions robot without gearbox
++play, MuJoCo Warp's own contacts and no BAM current limit; it keeps the walking task's 61-wide actor input,
++randomization and terminations.
++"""
++
++import math
++
++from isaaclab.managers import EventTermCfg as EventTerm
++from isaaclab.managers import RewardTermCfg as RewTerm
++from isaaclab.managers import SceneEntityCfg
++from isaaclab.sensors import ContactSensorCfg
++from isaaclab.utils.configclass import configclass
++
++from isaaclab_assets.robots.microduck import MICRODUCK_ALLCOLLISIONS_CFG, MICRODUCK_JOINT_NAMES
++
++from . import mdp
++from .flamingo_pose import FLAMINGO_BASE_PITCH, FLAMINGO_BASE_ROLL, FLAMINGO_GRAVITY_B, FLAMINGO_POSE_RIGHT, FLAMINGO_Z
++from .flat_env_cfg import (
++    CommandsCfg,
++    CurriculumCfg,
++    EventsCfg,
++    MicroDuckSceneCfg,
++    MicroDuckVelocityFlatEnvCfg,
++    ObservationsCfg,
++    _schedule,
++)
++
++_SERVOS = MICRODUCK_ALLCOLLISIONS_CFG.actuators["servos"]
++MICRODUCK_FLAMINGO_ROBOT_CFG = MICRODUCK_ALLCOLLISIONS_CFG.replace(
++    actuators={"servos": _SERVOS.replace(motor=_SERVOS.motor.replace(max_current=0.0))}
++)
++"""The all-collisions MicroDuck without the BAM current limit, which microduck_rl leaves commented out."""
++
++_ROBOT_GEOMETRY = "{ENV_REGEX_NS}/Robot/Geometry/trunk_base(/.*)?"
++_SERVO_JOINT_CFG = SceneEntityCfg("robot", joint_names=MICRODUCK_JOINT_NAMES, preserve_order=True)
++_TRUNK_BODY_CFG = SceneEntityCfg("robot", body_names=["trunk_base"])
++_STANCE_FOOT_CFG = SceneEntityCfg("robot", body_names=["ankle_right"])
++_SWING_FOOT_CFG = SceneEntityCfg("robot", body_names=["ankle_left"])
++_STANCE_SENSOR_CFG = SceneEntityCfg("contact_forces", body_names=["ankle_right"])
++_SWING_SENSOR_CFG = SceneEntityCfg("contact_forces", body_names=["ankle_left"])
++
++FLAMINGO_STANCE_SIDE_TILT = 0.45
++"""Trunk-frame gravity ``-g_b,y`` beyond which the trunk rolls further toward the stance side than the pose (0.38)."""
++FLAMINGO_SWING_FOOT_TARGET_Z = 0.05
++"""microduck_rl's stage-1 swing-foot site height target [m]; the pose itself holds the site at about 0.17 m."""
++
++
++@configclass
++class FlamingoSceneCfg(MicroDuckSceneCfg):
++    """The all-collisions robot with self-contacts sensed between any two bodies."""
++
++    robot = MICRODUCK_FLAMINGO_ROBOT_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
++    self_collision = ContactSensorCfg(prim_path=_ROBOT_GEOMETRY, filter_prim_paths_expr=[_ROBOT_GEOMETRY])
++
++
++@configclass
++class FlamingoObservationsCfg(ObservationsCfg):
++    """The walking observations without the critic's foot heights, which microduck_rl drops."""
++
++    def __post_init__(self):
++        self.critic.foot_height = None
++
++
++@configclass
++class FlamingoCommandsCfg(CommandsCfg):
++    """microduck_rl's near-zero twist resampled every 6 to 12 s, the walking head command and a zero body pose."""
++
++    base_velocity = mdp.MicroDuckVelocityCommandCfg(
++        asset_name="robot",
++        resampling_time_range=(6.0, 12.0),
++        rel_standing_envs=0.0,
++        debug_vis=False,
++        ranges=mdp.MicroDuckVelocityCommandCfg.Ranges(
++            lin_vel_x=(-0.01, 0.01), lin_vel_y=(-0.01, 0.01), ang_vel_z=(-0.05, 0.05)
++        ),
++    )
++    body_pose = mdp.UniformPoseDeltaCommandCfg(resampling_time_range=(2.0, 5.0), ranges=((0.0, 0.0),) * 6)
++
++
++@configclass
++class FlamingoRewardsCfg:
++    """microduck_rl's stage-1 rewards; its non-positive terms are costs with negative weights here."""
++
++    # Balance: the whole-robot CoM over the stance foot site; std tightened to 0.02 by the curriculum.
++    com_over_stance_foot = RewTerm(
++        func=mdp.com_over_foot, weight=3.0, params={"std": 0.03, "asset_cfg": _STANCE_FOOT_CFG}
++    )
++    stance_foot_grounded = RewTerm(func=mdp.foot_in_contact, weight=1.0, params={"sensor_cfg": _STANCE_SENSOR_CFG})
++    swing_foot_clear = RewTerm(
++        func=mdp.foot_site_height_gaussian,
++        weight=1.5,
++        params={
++            "target": FLAMINGO_SWING_FOOT_TARGET_Z,
++            "std": 0.03,
++            "asset_cfg": _SWING_FOOT_CFG,
++            "gate_sensor_cfg": _STANCE_SENSOR_CFG,
++        },
++    )
++    # Soft failure: the free foot lands; cheap and never terminal.
++    swing_foot_touch = RewTerm(func=mdp.foot_in_contact, weight=-0.5, params={"sensor_cfg": _SWING_SENSOR_CFG})
++    pose_flamingo = RewTerm(
++        func=mdp.pose_target_match,
++        weight=1.5,
++        params={"target": FLAMINGO_POSE_RIGHT, "std": 0.5, "asset_cfg": _SERVO_JOINT_CFG},
++    )
++    # The trunk lean is part of the pose, so its gravity direction is rewarded instead of uprightness.
++    gravity_flamingo = RewTerm(
++        func=mdp.projected_gravity_match, weight=2.0, params={"target": FLAMINGO_GRAVITY_B, "std": 0.15}
++    )
++    stillness = RewTerm(
++        func=mdp.joint_vel_gaussian,
++        weight=1.0,
++        params={"std": 2.0, "asset_cfg": _SERVO_JOINT_CFG, "gate_sensor_cfg": _STANCE_SENSOR_CFG},
++    )
++    # Hard failure: rolling over the stance foot has no catch.
++    stance_side_tilt = RewTerm(
++        func=mdp.lateral_tilt_cost, weight=-4.0, params={"threshold": FLAMINGO_STANCE_SIDE_TILT, "direction": -1.0}
++    )
++    joint_limit_proximity = RewTerm(
++        func=mdp.joint_limit_proximity, weight=-1.0, params={"margin": 0.1, "asset_cfg": _SERVO_JOINT_CFG}
++    )
++    action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-0.1)
++    joint_torque_rate_l2 = RewTerm(func=mdp.joint_torque_rate_l2, weight=0.0, params={"asset_cfg": _SERVO_JOINT_CFG})
++    body_ang_vel = RewTerm(func=mdp.body_ang_vel_xy_l2, weight=-0.05, params={"asset_cfg": _TRUNK_BODY_CFG})
++    angular_momentum = RewTerm(func=mdp.angular_momentum_l2, weight=-0.02)
++    self_collisions = RewTerm(
++        func=mdp.self_collision_cost, weight=-1.0, params={"sensor_cfg": SceneEntityCfg("self_collision")}
++    )
++
++
++@configclass
++class FlamingoEventsCfg(EventsCfg):
++    """Spawn in the one-foot pose instead of the walking stance; pushes start at zero."""
++
++    reset_base = None
++    reset_robot_joints = None
++    reset_flamingo_pose = EventTerm(
++        func=mdp.reset_flamingo_pose,
++        mode="reset",
++        params={
++            "joint_pose": FLAMINGO_POSE_RIGHT,
++            "base_roll": FLAMINGO_BASE_ROLL,
++            "base_pitch": FLAMINGO_BASE_PITCH,
++            "z_range": (FLAMINGO_Z, FLAMINGO_Z + 0.01),
++            # microduck_rl's generic reset_base offsets x and y before set_flamingo_state overrides the rest.
++            "xy_range": 0.5,
++            "tilt_noise": math.radians(3.0),
++            "joint_noise_std": 0.05,
++            "asset_cfg": _SERVO_JOINT_CFG,
++        },
++    )
++
++    def __post_init__(self):
++        self.push_robot.params["velocity_range"] = {"x": (0.0, 0.0), "y": (0.0, 0.0)}
++
++
++@configclass
++class FlamingoCurriculumCfg(CurriculumCfg):
++    """microduck_rl's stage-1 schedules, in its iterations; the CoM randomization ramps as in walking."""
++
++    head_pose_bias_weight = None
++    standing_envs = None
++    head_pose_range = None
++    action_rate_weight = _schedule("rewards.action_rate_l2.weight", (400, -0.5), (800, -1.0))
++    push_magnitude = _schedule(
++        "events.push_robot.params.velocity_range",
++        (300, {"x": (-0.08, 0.08), "y": (-0.08, 0.08)}),
++        (600, {"x": (-0.15, 0.15), "y": (-0.15, 0.15)}),
++        (1000, {"x": (-0.25, 0.25), "y": (-0.25, 0.25)}),
++    )
++    torque_rate_weight = _schedule("rewards.joint_torque_rate_l2.weight", (600, -1e-3))
++    com_std = _schedule("rewards.com_over_stance_foot.params.std", (500, 0.02))
++
++
++@configclass
++class MicroDuckFlamingoFlatEnvCfg(MicroDuckVelocityFlatEnvCfg):
++    """MicroDuck one-foot balance on the right foot with Newton MJWarp and BAM servos."""
++
++    scene: FlamingoSceneCfg = FlamingoSceneCfg(num_envs=4096, env_spacing=2.0)
++    observations: FlamingoObservationsCfg = FlamingoObservationsCfg()
++    commands: FlamingoCommandsCfg = FlamingoCommandsCfg()
++    rewards: FlamingoRewardsCfg = FlamingoRewardsCfg()
++    events: FlamingoEventsCfg = FlamingoEventsCfg()
++    curriculum: FlamingoCurriculumCfg = FlamingoCurriculumCfg()
++
++    def __post_init__(self):
++        super().__post_init__()
++        self.episode_length_s = 6.0
++        # microduck_rl runs MuJoCo Warp's own collision detection instead of Newton's pipeline.
++        self.sim.physics.solver_cfg.use_mujoco_contacts = True
++        self.sim.physics.collision_cfg = None
+diff --git a/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/mdp/__init__.pyi b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/mdp/__init__.pyi
+index 2852c1d10..cfd6c9282 100644
+--- a/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/mdp/__init__.pyi
++++ b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/mdp/__init__.pyi
+@@ -21,7 +21,17 @@ __all__ = [
+     "randomize_encoder_bias",
+     # flamingo
+     "MICRODUCK_FOOT_SITE_OFFSET",
++    "com_over_foot",
++    "foot_in_contact",
++    "foot_site_height_gaussian",
+     "foot_site_pos_w",
++    "joint_limit_proximity",
++    "joint_torque_rate_l2",
++    "joint_vel_gaussian",
++    "lateral_tilt_cost",
++    "pose_target_match",
++    "projected_gravity_match",
++    "reset_flamingo_pose",
+     "robot_com_pos_w",
+     # observations
+     "ImuNoiseCfg",
+@@ -66,7 +76,21 @@ from .commands import (
+ )
+ from .curriculums import microduck_terrain_levels, staged_value
+ from .events import randomize_bam_friction, randomize_encoder_bias
+-from .flamingo import MICRODUCK_FOOT_SITE_OFFSET, foot_site_pos_w, robot_com_pos_w
++from .flamingo import (
++    MICRODUCK_FOOT_SITE_OFFSET,
++    com_over_foot,
++    foot_in_contact,
++    foot_site_height_gaussian,
++    foot_site_pos_w,
++    joint_limit_proximity,
++    joint_torque_rate_l2,
++    joint_vel_gaussian,
++    lateral_tilt_cost,
++    pose_target_match,
++    projected_gravity_match,
++    reset_flamingo_pose,
++    robot_com_pos_w,
++)
+ from .observations import (
+     ImuNoiseCfg,
+     foot_air_time_safe,
+diff --git a/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/mdp/flamingo.py b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/mdp/flamingo.py
+index 9469607ee..c52954b3e 100644
+--- a/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/mdp/flamingo.py
++++ b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/mdp/flamingo.py
+@@ -3,7 +3,13 @@
+ #
+ # SPDX-License-Identifier: BSD-3-Clause
+ 
+-"""Whole-robot and foot-site measurements for the one-foot flamingo task."""
++"""Measurements, rewards and the reset of the one-foot flamingo task.
++
++The rewards port the stage-1 terms of microduck_rl (``src/mjlab_microduck/tasks/mdp.py`` on the ``flamingo``
++branch, ``4757d6ae``). microduck_rl writes penalties as non-positive values with positive weights; here they are
++non-negative costs for negative weights, as in the rest of the MicroDuck task. Foot contact is the contact sensor's
++per-body contact time instead of microduck_rl's per-geom ``found`` flag.
++"""
+ 
+ from __future__ import annotations
+ 
+@@ -12,10 +18,16 @@ from typing import TYPE_CHECKING
+ 
+ import torch
+ 
+-from isaaclab.utils.math import quat_apply
++from isaaclab.managers import ManagerTermBase, SceneEntityCfg
++from isaaclab.utils.math import quat_apply, quat_from_euler_xyz
++
++from .observations import zero_non_finite
+ 
+ if TYPE_CHECKING:
+     from isaaclab.assets import Articulation
++    from isaaclab.envs import ManagerBasedEnv, ManagerBasedRLEnv
++    from isaaclab.managers import RewardTermCfg
++    from isaaclab.sensors import ContactSensor
+ 
+ MICRODUCK_FOOT_SITE_OFFSET = (0.0, -0.02381, -0.01409)
+ """Position [m] of the ``left_foot`` / ``right_foot`` sites in their ankle frames, identical in the MJCF and USD."""
+@@ -40,3 +52,183 @@ def foot_site_pos_w(
+     quat = asset.data.body_link_quat_w.torch[:, body_ids]
+     local = torch.tensor(offset, device=pos.device, dtype=pos.dtype).expand_as(pos)
+     return pos + quat_apply(quat, local)
++
++
++"""
++Rewards.
++"""
++
++
++def foot_in_contact(env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg) -> torch.Tensor:
++    """1 while every selected foot touches the ground, else 0."""
++    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
++    contact_time = contact_sensor.data.current_contact_time.torch[:, sensor_cfg.body_ids]
++    return (zero_non_finite(contact_time) > 0.0).all(dim=1).float()
++
++
++def com_over_foot(env: ManagerBasedRLEnv, std: float, asset_cfg: SceneEntityCfg) -> torch.Tensor:
++    """Gaussian of the horizontal distance between the whole-robot CoM and the foot site of ankle ``asset_cfg``."""
++    asset: Articulation = env.scene[asset_cfg.name]
++    com_xy = robot_com_pos_w(asset)[:, :2]
++    foot_xy = foot_site_pos_w(asset, asset_cfg.body_ids)[:, 0, :2]
++    dist2 = torch.nan_to_num(((com_xy - foot_xy) ** 2).sum(dim=-1), nan=1.0)
++    return torch.exp(-dist2 / std**2)
++
++
++def foot_site_height_gaussian(
++    env: ManagerBasedRLEnv,
++    target: float,
++    std: float,
++    asset_cfg: SceneEntityCfg,
++    gate_sensor_cfg: SceneEntityCfg | None = None,
++) -> torch.Tensor:
++    """Gaussian of the foot-site height [m] of ankle ``asset_cfg`` above the env origin around ``target``.
++
++    With ``gate_sensor_cfg``, paid only while that (stance) foot is down, so hopping cannot farm it.
++    """
++    asset: Articulation = env.scene[asset_cfg.name]
++    z = foot_site_pos_w(asset, asset_cfg.body_ids)[:, 0, 2] - env.scene.env_origins[:, 2]
++    reward = torch.exp(-(((zero_non_finite(z) - target) / std) ** 2))
++    if gate_sensor_cfg is not None:
++        reward = reward * foot_in_contact(env, gate_sensor_cfg)
++    return reward
++
++
++def projected_gravity_match(
++    env: ManagerBasedRLEnv,
++    target: tuple[float, float, float],
++    std: float,
++    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
++) -> torch.Tensor:
++    """Gaussian of the distance between the trunk-frame gravity direction and ``target``, to hold a trunk lean."""
++    asset: Articulation = env.scene[asset_cfg.name]
++    gravity = zero_non_finite(asset.data.projected_gravity_b.torch)
++    target_t = torch.tensor(target, device=gravity.device, dtype=gravity.dtype)
++    return torch.exp(-((gravity - target_t) ** 2).sum(dim=-1) / std**2)
++
++
++def lateral_tilt_cost(
++    env: ManagerBasedRLEnv,
++    threshold: float,
++    direction: float,
++    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
++) -> torch.Tensor:
++    """Squared excess of ``direction * g_b,y`` over ``threshold``: rolling further toward one side than the pose.
++
++    With ``direction=-1`` this is the stance side of the right-foot pose, the fall direction with no foot to catch it.
++    """
++    asset: Articulation = env.scene[asset_cfg.name]
++    gravity_y = zero_non_finite(asset.data.projected_gravity_b.torch[:, 1])
++    return torch.clamp(direction * gravity_y - threshold, min=0.0) ** 2
++
++
++def joint_vel_gaussian(
++    env: ManagerBasedRLEnv,
++    std: float,
++    asset_cfg: SceneEntityCfg,
++    gate_sensor_cfg: SceneEntityCfg | None = None,
++) -> torch.Tensor:
++    """Stillness: Gaussian of the mean squared joint speed [rad/s], optionally only while the stance foot is down."""
++    asset: Articulation = env.scene[asset_cfg.name]
++    joint_vel = zero_non_finite(asset.data.joint_vel.torch[:, asset_cfg.joint_ids])
++    reward = torch.exp(-(joint_vel**2).mean(dim=-1) / std**2)
++    if gate_sensor_cfg is not None:
++        reward = reward * foot_in_contact(env, gate_sensor_cfg)
++    return reward
++
++
++def pose_target_match(
++    env: ManagerBasedRLEnv, target: Sequence[float], std: float, asset_cfg: SceneEntityCfg
++) -> torch.Tensor:
++    """Mean over joints ``asset_cfg`` of per-joint Gaussians around the joint positions ``target`` [rad]."""
++    asset: Articulation = env.scene[asset_cfg.name]
++    joint_pos = zero_non_finite(asset.data.joint_pos.torch[:, asset_cfg.joint_ids])
++    target_t = torch.tensor(target, device=joint_pos.device, dtype=joint_pos.dtype)
++    return torch.exp(-(((joint_pos - target_t) / std) ** 2)).mean(dim=-1)
++
++
++def joint_limit_proximity(env: ManagerBasedRLEnv, margin: float, asset_cfg: SceneEntityCfg) -> torch.Tensor:
++    """Summed depth [rad] of joints ``asset_cfg`` inside a ``margin`` band next to their hard limits.
++
++    Unlike the soft-limit penalty, this bites before a low-gain servo parks a joint on its stop.
++    """
++    asset: Articulation = env.scene[asset_cfg.name]
++    joint_pos = zero_non_finite(asset.data.joint_pos.torch[:, asset_cfg.joint_ids])
++    limits = asset.data.joint_pos_limits.torch[:, asset_cfg.joint_ids]
++    below = torch.clamp(limits[..., 0] + margin - joint_pos, min=0.0)
++    above = torch.clamp(joint_pos - (limits[..., 1] - margin), min=0.0)
++    return (below + above).sum(dim=-1)
++
++
++class joint_torque_rate_l2(ManagerTermBase):
++    """Sum of squared changes of the servo torques [N.m] since the previous evaluation.
++
++    As in microduck_rl, the first evaluation returns zero and the previous torque is kept across resets. The reward
++    manager skips zero-weight terms, so the history starts when a curriculum first gives the term a weight.
++    """
++
++    def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRLEnv):
++        super().__init__(cfg, env)
++        self._prev_torque: torch.Tensor | None = None
++
++    def __call__(self, env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
++        asset: Articulation = env.scene[asset_cfg.name]
++        torque = zero_non_finite(asset.actuators.applied_effort.torch[:, asset_cfg.joint_ids]).clone()
++        if self._prev_torque is None:
++            self._prev_torque = torque
++            return torch.zeros(env.num_envs, device=env.device)
++        rate = torque - self._prev_torque
++        self._prev_torque = torque
++        return (rate**2).sum(dim=-1)
++
++
++"""
++Events.
++"""
++
++
++def reset_flamingo_pose(
++    env: ManagerBasedEnv,
++    env_ids: torch.Tensor | None,
++    joint_pose: Sequence[float],
++    base_roll: float,
++    base_pitch: float,
++    z_range: tuple[float, float],
++    xy_range: float = 0.0,
++    tilt_noise: float = 0.0,
++    joint_noise_std: float = 0.0,
++    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
++) -> None:
++    """Place environments at rest in the one-foot pose, as microduck_rl's ``set_flamingo_state``.
++
++    The trunk gets roll ``base_roll`` and pitch ``base_pitch`` [rad] each with uniform noise of ``tilt_noise`` [rad],
++    a uniform yaw, a height drawn from ``z_range`` [m] and a horizontal offset within ``xy_range`` [m] of the env
++    origin. Joints ``asset_cfg`` get ``joint_pose`` [rad] plus Gaussian noise of ``joint_noise_std`` [rad], not clipped
++    to the joint ranges.
++    """
++    asset: Articulation = env.scene[asset_cfg.name]
++    if env_ids is None or isinstance(env_ids, slice):
++        env_ids = torch.arange(env.num_envs, device=env.device)[env_ids if env_ids is not None else slice(None)]
++    n = len(env_ids)
++    if n == 0:
++        return
++
++    def uniform(low: float, high: float) -> torch.Tensor:
++        return torch.empty(n, device=env.device).uniform_(low, high)
++
++    roll = base_roll + uniform(-tilt_noise, tilt_noise)
++    pitch = base_pitch + uniform(-tilt_noise, tilt_noise)
++    yaw = uniform(-torch.pi, torch.pi)
++    root = torch.zeros(n, 7, device=env.device)
++    root[:, :3] = env.scene.env_origins[env_ids]
++    root[:, 0] += uniform(-xy_range, xy_range)
++    root[:, 1] += uniform(-xy_range, xy_range)
++    root[:, 2] += uniform(*z_range)
++    root[:, 3:] = quat_from_euler_xyz(roll, pitch, yaw)
++    asset.write_root_pose_to_sim_index(root_pose=root, env_ids=env_ids)
++    asset.write_root_velocity_to_sim_index(root_velocity=torch.zeros(n, 6, device=env.device), env_ids=env_ids)
++
++    joint_pos = asset.data.default_joint_pos.torch[env_ids].clone()
++    pose = torch.tensor(joint_pose, device=env.device, dtype=joint_pos.dtype).expand(n, -1)
++    joint_pos[:, asset_cfg.joint_ids] = pose + joint_noise_std * torch.randn_like(pose)
++    asset.write_joint_state_to_sim_index(position=joint_pos, velocity=torch.zeros_like(joint_pos), env_ids=env_ids)
+diff --git a/source/isaaclab_tasks/test/test_microduck_flamingo_env.py b/source/isaaclab_tasks/test/test_microduck_flamingo_env.py
+new file mode 100644
+index 000000000..34f631a4d
+--- /dev/null
++++ b/source/isaaclab_tasks/test/test_microduck_flamingo_env.py
+@@ -0,0 +1,241 @@
++# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
++# All rights reserved.
++#
++# SPDX-License-Identifier: BSD-3-Clause
++
++"""MicroDuck flamingo task, microduck_rl's stage 1 (``Mjlab-Flamingo-Flat-MicroDuck``) on Newton MJWarp.
++
++Reward values are compared with the microduck_rl formulas (``src/mjlab_microduck/tasks/mdp.py`` on the ``flamingo``
++branch, ``4757d6ae``); the environment tests check the settings copied from ``microduck_flamingo_env_cfg.py``.
++"""
++
++import math
++from types import SimpleNamespace
++
++import gymnasium as gym
++import pytest
++import torch
++
++import isaaclab.sim as sim_utils
++from isaaclab.managers import SceneEntityCfg
++from isaaclab.sim import SimulationContext
++from isaaclab.test.utils import DeviceScope, test_devices
++from isaaclab.utils.math import euler_xyz_from_quat, quat_from_euler_xyz
++
++import isaaclab_tasks  # noqa: F401
++from isaaclab_tasks.contrib.microduck import mdp
++from isaaclab_tasks.contrib.microduck.flamingo_pose import (
++    FLAMINGO_BASE_PITCH,
++    FLAMINGO_BASE_ROLL,
++    FLAMINGO_GRAVITY_B,
++    FLAMINGO_POSE_RIGHT,
++)
++from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
++
++from isaaclab_assets.robots.microduck import MICRODUCK_JOINT_NAMES
++
++FLAMINGO_TASK = "IsaacContrib-Flamingo-Flat-MicroDuck"
++
++_ROBOT_CFG = SceneEntityCfg("robot", joint_ids=[0, 1], body_ids=[0])
++
++
++def _fake_env(**data):
++    """An environment whose robot exposes ``data`` fields as ``.torch`` arrays."""
++    robot = SimpleNamespace(data=SimpleNamespace(**{k: SimpleNamespace(torch=v) for k, v in data.items()}))
++    return SimpleNamespace(scene={"robot": robot})
++
++
++def test_projected_gravity_match_peaks_at_the_target_lean():
++    target = torch.tensor(FLAMINGO_GRAVITY_B)
++    gravity = torch.stack([target, torch.tensor([0.0, 0.0, -1.0])])
++    env = _fake_env(projected_gravity_b=gravity)
++    reward = mdp.projected_gravity_match(env, target=FLAMINGO_GRAVITY_B, std=0.15)
++    expected = torch.exp(-((gravity - target) ** 2).sum(-1) / 0.15**2)
++    torch.testing.assert_close(reward, expected)
++    assert reward[0].item() == pytest.approx(1.0)
++
++
++def test_lateral_tilt_cost_is_zero_inside_the_threshold_and_quadratic_toward_the_stance_side():
++    # g_b,y of the pose, at the threshold, past it toward the stance side, and toward the swing side.
++    gravity = torch.tensor([[0.0, -0.38, -0.9], [0.0, -0.45, -0.9], [0.0, -0.65, -0.7], [0.0, 0.65, -0.7]])
++    env = _fake_env(projected_gravity_b=gravity)
++    cost = mdp.lateral_tilt_cost(env, threshold=0.45, direction=-1.0)
++    torch.testing.assert_close(cost, torch.tensor([0.0, 0.0, 0.2**2, 0.0]))
++
++
++def test_pose_target_match_averages_per_joint_gaussians():
++    joint_pos = torch.tensor([[0.3, -0.2], [0.8, -0.2]])
++    env = _fake_env(joint_pos=joint_pos)
++    reward = mdp.pose_target_match(env, target=[0.3, -0.2], std=0.5, asset_cfg=_ROBOT_CFG)
++    torch.testing.assert_close(reward, torch.tensor([1.0, (math.exp(-1.0) + 1.0) / 2.0]))
++
++
++def test_joint_limit_proximity_ramps_linearly_inside_the_band_of_the_hard_limits():
++    limits = torch.tensor([[[-0.4, 0.4], [-1.0, 1.0]]]).expand(3, 2, 2)
++    # Interior; 0.05 into the band of joint 0's upper limit; past joint 1's lower stop by 0.1.
++    joint_pos = torch.tensor([[0.0, 0.0], [0.35, 0.0], [0.0, -1.1]])
++    env = _fake_env(joint_pos=joint_pos, joint_pos_limits=limits)
++    cost = mdp.joint_limit_proximity(env, margin=0.1, asset_cfg=_ROBOT_CFG)
++    torch.testing.assert_close(cost, torch.tensor([0.0, 0.05, 0.2]))
++
++
++def test_joint_vel_gaussian_is_gated_on_the_stance_foot():
++    joint_vel = torch.tensor([[0.0, 0.0], [2.0, 0.0], [0.0, 0.0]])
++    contact_time = torch.tensor([[0.1], [0.1], [0.0]])
++    env = _fake_env(joint_vel=joint_vel)
++    sensor = SimpleNamespace(data=SimpleNamespace(current_contact_time=SimpleNamespace(torch=contact_time)))
++    env.scene = type("Scene", (dict,), {"sensors": {"contact_forces": sensor}})(env.scene)
++    gate = SceneEntityCfg("contact_forces", body_ids=[0])
++    reward = mdp.joint_vel_gaussian(env, std=2.0, asset_cfg=_ROBOT_CFG, gate_sensor_cfg=gate)
++    torch.testing.assert_close(reward, torch.tensor([1.0, math.exp(-0.5), 0.0]))
++
++
++def test_reset_orientation_matches_microduck_rl_zyx_euler():
++    """``set_flamingo_state`` composes yaw, pitch and roll in this order; Isaac Lab's helper must agree."""
++    roll, pitch, yaw = torch.tensor([0.39]), torch.tensor([-0.16]), torch.tensor([2.1])
++    cy, sy = torch.cos(yaw / 2), torch.sin(yaw / 2)
++    cp, sp = torch.cos(pitch / 2), torch.sin(pitch / 2)
++    cr, sr = torch.cos(roll / 2), torch.sin(roll / 2)
++    wxyz = torch.stack(
++        [
++            cr * cp * cy + sr * sp * sy,
++            sr * cp * cy - cr * sp * sy,
++            cr * sp * cy + sr * cp * sy,
++            cr * cp * sy - sr * sp * cy,
++        ],
++        dim=-1,
++    )
++    torch.testing.assert_close(quat_from_euler_xyz(roll, pitch, yaw), wxyz[:, [1, 2, 3, 0]])
++
++
++"""
++Environment.
++"""
++
++
++@pytest.fixture(scope="module")
++def flamingo_env():
++    device = test_devices(DeviceScope.CUDA)[0]
++    cfg = parse_env_cfg(FLAMINGO_TASK, device=device, num_envs=64)
++    sim_utils.create_new_stage()
++    env = gym.make(FLAMINGO_TASK, cfg=cfg).unwrapped
++    env.reset()
++    yield env
++    env.close()
++    SimulationContext.clear_instance()
++
++
++@pytest.mark.integration
++@pytest.mark.kitless
++def test_flamingo_keeps_the_deployed_interface(flamingo_env):
++    env = flamingo_env
++    assert env.observation_manager.group_obs_dim["policy"] == (61,)
++    assert env.action_manager.total_action_dim == 14
++    # microduck_rl zero-pads the body-pose slots and drops the critic's foot heights.
++    torch.testing.assert_close(
++        env.command_manager.get_command("body_pose"), torch.zeros(env.num_envs, 6, device=env.device)
++    )
++    assert "foot_height" not in env.observation_manager.active_terms["critic"]
++    assert env.cfg.commands.base_velocity.resampling_time_range == (6.0, 12.0)
++    assert env.cfg.commands.base_velocity.rel_standing_envs == 0.0
++    assert env.max_episode_length_s == pytest.approx(6.0)
++
++
++@pytest.mark.integration
++@pytest.mark.kitless
++def test_flamingo_runs_the_all_collisions_robot_like_microduck_rl(flamingo_env):
++    env = flamingo_env
++    robot = env.scene["robot"]
++    assert env.cfg.scene.robot.spawn.usd_path.endswith("microduck_allcollisions.usd")
++    assert not any(name.startswith("passive_") for name in robot.joint_names)
++    assert env.cfg.sim.physics.solver_cfg.use_mujoco_contacts
++    assert env.cfg.sim.physics.collision_cfg is None
++    # microduck_rl comments out the BAM current limit; zero disables it.
++    assert env.cfg.scene.robot.actuators["servos"].motor.max_current == 0.0
++    # Self-collisions are watched over the whole body, as microduck_rl's trunk_base subtree sensor.
++    sensor = env.scene["self_collision"]
++    assert sorted(sensor.body_names) == sorted(robot.body_names)
++    assert sensor.data.force_matrix_w.torch.shape[1:3] == (robot.num_bodies, robot.num_bodies)
++
++
++@pytest.mark.integration
++@pytest.mark.kitless
++def test_flamingo_rewards_match_microduck_rl_stage_one(flamingo_env):
++    """Weights of microduck_rl's terms, with its self-negating terms flipped to Isaac Lab's cost convention."""
++    expected = {
++        "com_over_stance_foot": 3.0,
++        "stance_foot_grounded": 1.0,
++        "swing_foot_clear": 1.5,
++        "swing_foot_touch": -0.5,
++        "pose_flamingo": 1.5,
++        "gravity_flamingo": 2.0,
++        "stillness": 1.0,
++        "stance_side_tilt": -4.0,
++        "joint_limit_proximity": -1.0,
++        "action_rate_l2": -0.1,
++        "joint_torque_rate_l2": 0.0,
++        "body_ang_vel": -0.05,
++        "angular_momentum": -0.02,
++        "self_collisions": -1.0,
++    }
++    manager = flamingo_env.reward_manager
++    weights = {name: manager.get_term_cfg(name).weight for name in manager.active_terms}
++    assert weights == pytest.approx(expected)
++    assert manager.get_term_cfg("com_over_stance_foot").params["std"] == 0.03
++    assert manager.get_term_cfg("swing_foot_clear").params["target"] == 0.05
++
++
++@pytest.mark.integration
++@pytest.mark.kitless
++def test_flamingo_spawns_in_the_noised_one_foot_pose(flamingo_env):
++    env = flamingo_env
++    env.reset()
++    robot = env.scene["robot"]
++    joint_ids = robot.find_joints(MICRODUCK_JOINT_NAMES, preserve_order=True)[0]
++    error = robot.data.joint_pos.torch[:, joint_ids] - torch.tensor(FLAMINGO_POSE_RIGHT, device=env.device)
++    # Gaussian joint noise of 0.05 rad around the pose.
++    assert error.abs().mean().item() == pytest.approx(0.05 * math.sqrt(2.0 / math.pi), rel=0.25)
++    roll, pitch, _ = euler_xyz_from_quat(robot.data.root_link_quat_w.torch)
++    tilt = math.radians(3.0) + 1e-4
++    assert ((roll - FLAMINGO_BASE_ROLL).abs() <= tilt).all()
++    assert ((pitch - FLAMINGO_BASE_PITCH).abs() <= tilt).all()
++    offset = robot.data.root_link_pos_w.torch - env.scene.env_origins
++    assert ((offset[:, 2] >= 0.120 - 1e-4) & (offset[:, 2] <= 0.130 + 1e-4)).all()
++    assert (offset[:, :2].abs() <= 0.5 + 1e-4).all()
++    torch.testing.assert_close(robot.data.root_link_vel_w.torch, torch.zeros(env.num_envs, 6, device=env.device))
++
++
++@pytest.mark.integration
++@pytest.mark.kitless
++def test_flamingo_steps_with_finite_rewards_and_lands_on_the_right_foot(flamingo_env):
++    env = flamingo_env
++    env.reset()
++    actions = torch.zeros(env.num_envs, 14, device=env.device)
++    for _ in range(10):
++        _, reward, *_ = env.step(actions)
++        assert torch.isfinite(reward).all()
++    stance_cfg = SceneEntityCfg("contact_forces", body_names=["ankle_right"])
++    stance_cfg.resolve(env.scene)
++    stance = mdp.foot_in_contact(env, stance_cfg)
++    assert stance.mean().item() > 0.5
++
++
++@pytest.mark.integration
++@pytest.mark.kitless
++def test_flamingo_curriculum_reaches_the_final_microduck_rl_stages(flamingo_env):
++    env = flamingo_env
++    saved = env.common_step_counter
++    try:
++        env.common_step_counter = 1500 * 24
++        env.curriculum_manager.compute(env_ids=torch.arange(env.num_envs, device=env.device))
++        assert env.event_manager.get_term_cfg("push_robot").params["velocity_range"] == {
++            "x": (-0.25, 0.25),
++            "y": (-0.25, 0.25),
++        }
++        assert env.reward_manager.get_term_cfg("action_rate_l2").weight == -1.0
++        assert env.reward_manager.get_term_cfg("joint_torque_rate_l2").weight == -1e-3
++        assert env.reward_manager.get_term_cfg("com_over_stance_foot").params["std"] == 0.02
++        assert env.event_manager.get_term_cfg("randomize_com").params["com_range"]["x"] == (-0.015, 0.015)
++        assert env.event_manager.get_term_cfg("randomize_head_com").params["com_range"]["x"] == (-0.01, 0.01)
++    finally:
++        env.common_step_counter = saved
+-- 
+2.43.0
+

@@ -1,0 +1,845 @@
+From 806c484b32bb8bce75387c483dda2344e6088645 Mon Sep 17 00:00:00 2001
+From: Nakapen <nakapen@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 11:31:32 +0900
+Subject: [PATCH 03/19] #local add:flamingo_static_check
+
+---
+ .../microduck/check_flamingo_pose.py          | 244 +++++++++++++++
+ .../changelog.d/hop-local-hop-task.added.rst  |   5 +
+ .../contrib/microduck/flamingo_checks.py      | 286 ++++++++++++++++++
+ .../contrib/microduck/flamingo_pose.py        |  52 ++++
+ .../contrib/microduck/mdp/__init__.pyi        |   5 +
+ .../contrib/microduck/mdp/flamingo.py         |  42 +++
+ .../test/test_microduck_flamingo.py           | 132 ++++++++
+ 7 files changed, 766 insertions(+)
+ create mode 100644 scripts/reinforcement_learning/microduck/check_flamingo_pose.py
+ create mode 100644 source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_checks.py
+ create mode 100644 source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_pose.py
+ create mode 100644 source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/mdp/flamingo.py
+ create mode 100644 source/isaaclab_tasks/test/test_microduck_flamingo.py
+
+diff --git a/scripts/reinforcement_learning/microduck/check_flamingo_pose.py b/scripts/reinforcement_learning/microduck/check_flamingo_pose.py
+new file mode 100644
+index 000000000..836d98f05
+--- /dev/null
++++ b/scripts/reinforcement_learning/microduck/check_flamingo_pose.py
+@@ -0,0 +1,244 @@
++# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
++# All rights reserved.
++#
++# SPDX-License-Identifier: BSD-3-Clause
++
++"""Check the upstream flamingo one-foot pose on the Newton MJWarp MicroDuck before training on it.
++
++C1 (geometry, no physics step): for each stance side, place the robot with the stance sole flat and measure the
++trunk lean, CoM margin inside the stance sole, lifted-foot clearance and joint-limit margins, next to the upstream
++values and to the upstream trunk placement taken as is.
++C2 (hold): from that placement, hold the pose's joint targets for ``--duration`` seconds and record when and which
++way the robot falls; the default two-foot stance is run the same way for reference.
++
++Results go to ``logs/flamingo_static/<time>/report.md`` and ``timeseries.csv``.
++
++.. code-block:: bash
++
++    uv run python scripts/reinforcement_learning/microduck/check_flamingo_pose.py
++"""
++
++from __future__ import annotations
++
++import argparse
++import csv
++import math
++import os
++from dataclasses import asdict
++from datetime import datetime
++
++import torch
++
++from isaaclab.sim import SimulationContext
++from isaaclab.utils.math import euler_xyz_from_quat, quat_from_euler_xyz
++
++import isaaclab_tasks  # noqa: F401
++from isaaclab_tasks.contrib.microduck import mdp
++from isaaclab_tasks.contrib.microduck.flamingo_checks import (
++    make_check_env,
++    measure_pose,
++    place_robot,
++    polygon_signed_distance,
++    servo_joint_ids,
++    sole_support_hull,
++    sole_vertices_w,
++    solve_flat_sole_placement,
++)
++from isaaclab_tasks.contrib.microduck.flamingo_pose import (
++    FLAMINGO_BASE_PITCH,
++    FLAMINGO_BASE_ROLL,
++    FLAMINGO_COM_MARGIN,
++    FLAMINGO_GRAVITY_B,
++    FLAMINGO_POSE_LEFT,
++    FLAMINGO_POSE_RIGHT,
++    FLAMINGO_Z,
++)
++
++LIFTED_CLEARANCE_MIN = 0.05
++"""Lowest lifted-sole height [m] that counts as clearly lifted (upstream: swing foot at least 5 cm up)."""
++
++JOINT_MARGIN_MIN = 0.05 - 1e-4
++"""Joint-limit margin [rad] the pose must keep; 1e-4 rad covers upstream's rounded hip-roll range."""
++
++
++def _parse_args() -> argparse.Namespace:
++    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
++    parser.add_argument("--duration", type=float, default=3.0, help="Hold time per case [s].")
++    parser.add_argument("--vin", type=float, default=7.4, help="Servo supply voltage [V].")
++    parser.add_argument("--device", default="cuda:0")
++    parser.add_argument("--out_dir", default=None, help="Defaults to logs/flamingo_static/<time>.")
++    return parser.parse_args()
++
++
++def _geometry(env, pose: list[float], stance: str) -> dict:
++    """C1 for one stance side: the flat-sole placement and the upstream placement taken as is."""
++    sign = 1.0 if stance == "right" else -1.0
++    env.reset()
++    placement = solve_flat_sole_placement(env, pose, stance)
++    flat = measure_pose(env, pose, stance)
++    roll = torch.tensor([sign * FLAMINGO_BASE_ROLL], device=env.device)
++    upstream_quat = quat_from_euler_xyz(roll, torch.tensor([FLAMINGO_BASE_PITCH], device=env.device), roll * 0.0)
++    place_robot(env, pose, upstream_quat, FLAMINGO_Z)
++    upstream = measure_pose(env, pose, stance)
++    checks = {
++        "stance sole flat (tilt < 0.5 deg, lowest point at 0 +- 0.1 mm)": flat.stance_sole_tilt_deg < 0.5
++        and abs(flat.stance_sole_min_z) < 1e-4,
++        "CoM inside the stance sole (margin > 0)": flat.com_hull_margin > 0.0,
++        f"lifted sole >= {LIFTED_CLEARANCE_MIN * 100:.0f} cm up": flat.lifted_sole_min_z >= LIFTED_CLEARANCE_MIN,
++        "every joint >= 0.05 rad off its limit (1e-4 rad rounding)": flat.min_joint_limit_margin >= JOINT_MARGIN_MIN,
++    }
++    return {"stance": stance, "placement": placement, "flat": flat, "upstream": upstream, "checks": checks}
++
++
++def _hold(env, pose: list[float], stance: str, duration: float, label: str, rows: list[dict]) -> dict:
++    """C2: hold the joint targets of ``pose`` from the flat-sole placement and record the fall."""
++    robot = env.scene["robot"]
++    sensor = env.scene.sensors["contact_forces"]
++    lifted = "left" if stance == "right" else "right"
++    (stance_id, lifted_id), _ = sensor.find_sensors([f"ankle_{stance}", f"ankle_{lifted}"], True)
++    weight = robot.data.body_mass.torch[0].sum().item() * 9.81
++    sign = 1.0 if stance == "right" else -1.0
++
++    # Resetting clears the servo command delay, so the first delayed command is already the pose target.
++    env.reset()
++    placement = solve_flat_sole_placement(env, pose, stance)
++    pose_t = torch.tensor(pose, device=env.device)
++    actions = (pose_t - robot.data.default_joint_pos.torch[0, servo_joint_ids(env)])[None]
++    roll0 = placement.roll_deg
++
++    fall_time, first_lifted_contact, stance_forces, stance_sole_z = None, None, [], []
++    roll = pitch = roll0
++    for step in range(round(duration / env.step_dt)):
++        env.step(actions)
++        t = (step + 1) * env.step_dt
++        if env.termination_manager.terminated[0]:
++            fall_time = t
++            break
++        forces = sensor.data.net_forces_w.torch[0].norm(dim=-1)
++        r, p, _ = euler_xyz_from_quat(robot.data.root_link_quat_w.torch[0:1])
++        roll, pitch = math.degrees(r.item()), math.degrees(p.item())
++        com_xy = mdp.robot_com_pos_w(robot)[0, :2]
++        margin = polygon_signed_distance(com_xy, sole_support_hull(env, f"ankle_{stance}")[:, :2]).item()
++        sole_z = sole_vertices_w(env, f"ankle_{stance}")[:, 2].min().item() - env.scene.env_origins[0, 2].item()
++        if first_lifted_contact is None and forces[lifted_id] > 0.1:
++            first_lifted_contact = t
++        stance_forces.append(forces[stance_id].item())
++        stance_sole_z.append(sole_z)
++        rows.append(
++            {
++                "case": label,
++                "t": round(t, 3),
++                "roll_deg": roll,
++                "pitch_deg": pitch,
++                "trunk_z": robot.data.root_link_pos_w.torch[0, 2].item(),
++                "com_margin": margin,
++                "stance_force": forces[stance_id].item(),
++                "lifted_force": forces[lifted_id].item(),
++                "stance_sole_min_z": sole_z,
++            }
++        )
++    # Rolling further over the stance foot is the hard failure (no foot to catch the fall).
++    toward = "stance side" if sign * (roll - roll0) > 0 else "lifted side"
++    return {
++        "case": label,
++        "start roll/pitch [deg]": f"{roll0:.1f} / {placement.pitch_deg:.1f}",
++        "fall time [s]": f"{fall_time:.2f}" if fall_time is not None else f"none in {duration:.1f}",
++        "last roll/pitch [deg]": f"{roll:.1f} / {pitch:.1f}",
++        "rolled toward": f"{toward} ({roll - roll0:+.1f} deg)",
++        "first lifted-foot contact [s]": f"{first_lifted_contact:.2f}" if first_lifted_contact is not None else "none",
++        "stance force / weight": f"{sum(stance_forces) / max(len(stance_forces), 1) / weight:.2f}",
++        "stance sole min z [mm]": f"{min(stance_sole_z) * 1e3:.2f} .. {max(stance_sole_z) * 1e3:.2f}"
++        if stance_sole_z
++        else "-",
++    }
++
++
++def _report(args, geometry: list[dict], holds: list[dict]) -> list[str]:
++    lines = [
++        "# Flamingo pose static check (Newton MJWarp, MuJoCo Warp contacts)",
++        "",
++        f"robot: all-collisions USD, no backlash, no randomization, supply {args.vin} V without sag",
++        "",
++        "## C1 geometry",
++        "",
++    ]
++    for g in geometry:
++        flat, up = g["flat"], g["upstream"]
++        sign = 1.0 if g["stance"] == "right" else -1.0
++        gravity = (FLAMINGO_GRAVITY_B[0], sign * FLAMINGO_GRAVITY_B[1], FLAMINGO_GRAVITY_B[2])
++        # (quantity, upstream value, value under the upstream placement, value under the flat-sole placement)
++        rows = [
++            ("trunk roll [deg]", f"{sign * math.degrees(FLAMINGO_BASE_ROLL):.1f}", f"{up.roll_deg:.1f}",
++             f"{flat.roll_deg:.2f}"),
++            ("trunk pitch [deg]", f"{math.degrees(FLAMINGO_BASE_PITCH):.1f}", f"{up.pitch_deg:.1f}",
++             f"{flat.pitch_deg:.2f}"),
++            ("trunk z [m]", f"{FLAMINGO_Z:.3f}", f"{up.z:.3f}", f"{flat.z:.4f}"),
++            ("gravity in trunk", str(list(gravity)), str([round(v, 3) for v in up.gravity_b]),
++             str([round(v, 3) for v in flat.gravity_b])),
++            ("stance sole tilt [deg]", "0", f"{up.stance_sole_tilt_deg:.2f}", f"{flat.stance_sole_tilt_deg:.2f}"),
++            ("stance sole lowest z [mm]", "0", f"{up.stance_sole_min_z * 1e3:.2f}",
++             f"{flat.stance_sole_min_z * 1e3:.2f}"),
++            ("CoM margin in stance sole [cm]", f"{FLAMINGO_COM_MARGIN * 100:.2f}", f"{up.com_hull_margin * 100:.2f}",
++             f"{flat.com_hull_margin * 100:.2f}"),
++            ("CoM to stance site [cm]", "-", f"{up.com_to_stance_site * 100:.2f}",
++             f"{flat.com_to_stance_site * 100:.2f}"),
++            ("lifted site z [m]", "0.136 (design) / ~0.17 (cfg)", f"{up.lifted_site_z:.3f}",
++             f"{flat.lifted_site_z:.3f}"),
++            ("lifted sole lowest z [m]", "-", f"{up.lifted_sole_min_z:.3f}", f"{flat.lifted_sole_min_z:.3f}"),
++            ("min joint-limit margin [rad]", "0.05", f"{up.min_joint_limit_margin:.5f}",
++             f"{flat.min_joint_limit_margin:.5f} ({flat.min_joint_limit_joint})"),
++        ]  # fmt: skip
++        lines += [
++            f"### {g['stance']} stance",
++            "",
++            "| quantity | upstream value | upstream placement here | flat-sole placement here |",
++            "|---|---|---|---|",
++            *["| " + " | ".join(row) + " |" for row in rows],
++            "",
++            "| criterion (flat-sole placement) | pass |",
++            "|---|---|",
++            *[f"| {name} | {'yes' if ok else 'no'} |" for name, ok in g["checks"].items()],
++            "",
++        ]
++    lines += ["## C2 hold with fixed joint targets (recorded, not judged)", ""]
++    keys = list(holds[0].keys())
++    lines += ["| " + " | ".join(keys) + " |", "|---" * len(keys) + "|"]
++    lines += ["| " + " | ".join(str(h[k]) for k in keys) + " |" for h in holds]
++    return lines
++
++
++def main() -> None:
++    args = _parse_args()
++    out_dir = args.out_dir or os.path.join("logs", "flamingo_static", datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
++    os.makedirs(out_dir, exist_ok=True)
++    env = make_check_env(device=args.device, vin=args.vin)
++    try:
++        robot = env.scene["robot"]
++        home = robot.data.default_joint_pos.torch[0, servo_joint_ids(env)].tolist()
++        geometry = [_geometry(env, FLAMINGO_POSE_RIGHT, "right"), _geometry(env, FLAMINGO_POSE_LEFT, "left")]
++        rows: list[dict] = []
++        with torch.inference_mode():
++            holds = [
++                _hold(env, FLAMINGO_POSE_RIGHT, "right", args.duration, "flamingo right", rows),
++                _hold(env, FLAMINGO_POSE_LEFT, "left", args.duration, "flamingo left", rows),
++                _hold(env, home, "right", args.duration, "home two feet", rows),
++            ]
++    finally:
++        env.close()
++        SimulationContext.clear_instance()
++
++    with open(os.path.join(out_dir, "timeseries.csv"), "w", newline="") as file:
++        writer = csv.DictWriter(file, fieldnames=list(rows[0].keys()))
++        writer.writeheader()
++        writer.writerows(rows)
++    lines = _report(args, geometry, holds)
++    lines += ["", "Placements: " + "; ".join(f"{g['stance']}: {asdict(g['flat'])}" for g in geometry)]
++    path = os.path.join(out_dir, "report.md")
++    with open(path, "w") as file:
++        file.write("\n".join(lines) + "\n")
++    print("\n".join(lines))
++    print(f"[check_flamingo_pose] wrote {path}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/source/isaaclab_tasks/changelog.d/hop-local-hop-task.added.rst b/source/isaaclab_tasks/changelog.d/hop-local-hop-task.added.rst
+index 38f4f1e53..0b8fa0c2b 100644
+--- a/source/isaaclab_tasks/changelog.d/hop-local-hop-task.added.rst
++++ b/source/isaaclab_tasks/changelog.d/hop-local-hop-task.added.rst
+@@ -4,3 +4,8 @@
+ * Added :mod:`isaaclab_tasks.contrib.microduck.hop_metrics` and ``scripts/reinforcement_learning/microduck/eval_hop.py``
+   to evaluate exported MicroDuck single-leg policies on Newton MJWarp at fixed BAM supply voltages, reporting falls,
+   hops, flight time, centre-of-mass rise, torque saturation and the test-plan verdict per voltage.
++* Added the upstream MicroDuck one-foot "flamingo" pose in :mod:`isaaclab_tasks.contrib.microduck.flamingo_pose`,
++  the ``robot_com_pos_w`` and ``foot_site_pos_w`` MicroDuck measurements, and
++  :mod:`isaaclab_tasks.contrib.microduck.flamingo_checks` with
++  ``scripts/reinforcement_learning/microduck/check_flamingo_pose.py`` to check the pose's sole placement, centre-of-mass
++  margin, foot clearance and joint-limit margins on the all-collisions robot with MuJoCo Warp contacts.
+diff --git a/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_checks.py b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_checks.py
+new file mode 100644
+index 000000000..f4ae8045d
+--- /dev/null
++++ b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_checks.py
+@@ -0,0 +1,286 @@
++# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
++# All rights reserved.
++#
++# SPDX-License-Identifier: BSD-3-Clause
++
++"""Static checks of the upstream flamingo pose on the Newton MJWarp MicroDuck.
++
++:func:`make_check_env` builds the all-collisions robot without gearbox play, randomization or pushes.
++:func:`solve_flat_sole_placement` finds the trunk roll, pitch and height that put a stance sole flat on the floor
++for a given joint pose, :func:`place_robot` teleports the robot there, and :func:`measure_pose` reports the quantities
++the upstream design validated the pose with. Support hulls come from the sole collision meshes of the robot USD.
++"""
++
++from __future__ import annotations
++
++import math
++from dataclasses import dataclass
++from functools import cache
++from typing import TYPE_CHECKING
++
++import gymnasium as gym
++import torch
++
++import isaaclab.sim as sim_utils
++from isaaclab.utils.assets import retrieve_file_path
++from isaaclab.utils.math import euler_xyz_from_quat, quat_apply, quat_from_euler_xyz
++
++from isaaclab_assets.robots.microduck import MICRODUCK_ALLCOLLISIONS_CFG, MICRODUCK_JOINT_NAMES
++
++from . import mdp
++from .hop_metrics import set_supply_voltage
++
++if TYPE_CHECKING:
++    from isaaclab.envs import ManagerBasedRLEnv
++
++CHECK_TASK = "IsaacContrib-Velocity-Flat-MicroDuck"
++"""Registered task whose scene, servos and termination terms the checks reuse."""
++
++SOLE_FACE_TOLERANCE = 0.002
++"""Height band [m] above a sole's lowest vertex that counts as its contact face."""
++
++SOLE_UP_AXIS_IN_ANKLE = (0.0, 1.0, 0.0)
++"""Foot-site z axis expressed in the ankle frame, the same for both feet in the MJCF and USD."""
++
++_RANDOMIZATION_EVENTS = (
++    "push_robot",
++    "foot_friction",
++    "encoder_bias",
++    "mass_inertia",
++    "randomize_com",
++    "randomize_head_com",
++    "randomize_joint_friction",
++    "randomize_armature",
++)
++_RANDOMIZATION_CURRICULA = ("com_range", "head_com_range")
++
++
++def make_check_env(device: str = "cuda:0", num_envs: int = 1, vin: float = 7.4) -> ManagerBasedRLEnv:
++    """Build the all-collisions robot without backlash, randomization or pushes, at a fixed supply ``vin`` [V]."""
++    from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
++
++    cfg = parse_env_cfg(CHECK_TASK, device=device, num_envs=num_envs)
++    cfg.scene.robot = MICRODUCK_ALLCOLLISIONS_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
++    # Upstream mjlab uses MuJoCo Warp's own collision detection instead of Newton's pipeline.
++    cfg.sim.physics.solver_cfg.use_mujoco_contacts = True
++    cfg.sim.physics.collision_cfg = None
++    for name in _RANDOMIZATION_EVENTS:
++        setattr(cfg.events, name, None)
++    for name in _RANDOMIZATION_CURRICULA:
++        setattr(cfg.curriculum, name, None)
++    sim_utils.create_new_stage()
++    env = gym.make(CHECK_TASK, cfg=cfg).unwrapped
++    env.reset()
++    set_supply_voltage(env, torch.full((env.num_envs,), vin, device=env.device), sag_gain=0.0)
++    return env
++
++
++def servo_joint_ids(env: ManagerBasedRLEnv) -> list[int]:
++    """Articulation indices of the 14 servos in the robot's servo order."""
++    return env.scene["robot"].find_joints(MICRODUCK_JOINT_NAMES, preserve_order=True)[0]
++
++
++def place_robot(
++    env: ManagerBasedRLEnv, pose: list[float], quat: torch.Tensor, z: float, env_ids: torch.Tensor | None = None
++) -> None:
++    """Teleport environments to joint ``pose`` [rad] (servo order) with root orientation ``quat`` (x, y, z, w) and
++    root height ``z`` [m] above the environment origin, at rest."""
++    robot = env.scene["robot"]
++    if env_ids is None:
++        env_ids = torch.arange(env.num_envs, device=env.device)
++    n = len(env_ids)
++    root = torch.zeros(n, 7, device=env.device)
++    root[:, :3] = env.scene.env_origins[env_ids]
++    root[:, 2] += z
++    root[:, 3:] = quat.to(env.device).expand(n, 4)
++    robot.write_root_pose_to_sim_index(root_pose=root, env_ids=env_ids)
++    robot.write_root_velocity_to_sim_index(root_velocity=torch.zeros(n, 6, device=env.device), env_ids=env_ids)
++    joint_pos = robot.data.default_joint_pos.torch[env_ids].clone()
++    joint_pos[:, servo_joint_ids(env)] = torch.tensor(pose, device=env.device)
++    robot.write_joint_state_to_sim_index(position=joint_pos, velocity=torch.zeros_like(joint_pos), env_ids=env_ids)
++
++
++@cache
++def _sole_vertices_in_ankle(usd_path: str, foot: str) -> tuple[tuple[float, float, float], ...]:
++    """Vertices [m] of the enabled collision mesh under ankle body ``foot``, in the ankle frame."""
++    from pxr import Usd, UsdGeom, UsdPhysics
++
++    stage = Usd.Stage.Open(retrieve_file_path(usd_path))
++    prims = list(Usd.PrimRange(stage.GetPseudoRoot(), Usd.TraverseInstanceProxies()))
++    ankle = next(p for p in prims if p.GetName() == foot and not p.IsA(UsdGeom.Mesh))
++    cache_ = UsdGeom.XformCache()
++    vertices = []
++    for prim in Usd.PrimRange(ankle, Usd.TraverseInstanceProxies()):
++        if not (prim.IsA(UsdGeom.Mesh) and prim.HasAPI(UsdPhysics.CollisionAPI)):
++            continue
++        if UsdPhysics.CollisionAPI(prim).GetCollisionEnabledAttr().Get() is False:
++            continue
++        to_ankle, _ = cache_.ComputeRelativeTransform(prim, ankle)
++        vertices += [tuple(to_ankle.Transform(p)) for p in UsdGeom.Mesh(prim).GetPointsAttr().Get()]
++    if not vertices:
++        raise ValueError(f"No enabled collision mesh under '{foot}' in {usd_path}.")
++    return tuple(vertices)
++
++
++def _sole_vertices(env: ManagerBasedRLEnv, foot: str) -> torch.Tensor:
++    return torch.tensor(_sole_vertices_in_ankle(env.cfg.scene.robot.spawn.usd_path, foot), device=env.device)
++
++
++def sole_normal_in_ankle(env: ManagerBasedRLEnv, foot: str) -> tuple[torch.Tensor, float]:
++    """Outward (downward) normal of a sole's contact face in the ankle frame, and the face's RMS flatness [m].
++
++    The face is the band of vertices furthest along the foot site's downward axis; the normal is its plane fit.
++    """
++    vertices = _sole_vertices(env, foot)
++    down = -torch.tensor(SOLE_UP_AXIS_IN_ANKLE, device=env.device)
++    depth = vertices @ down
++    face = vertices[depth >= depth.max() - SOLE_FACE_TOLERANCE]
++    centered = face - face.mean(dim=0)
++    _, _, vh = torch.linalg.svd(centered, full_matrices=False)
++    normal = vh[-1]
++    normal = normal if normal @ down > 0 else -normal
++    return normal, (centered @ normal).square().mean().sqrt().item()
++
++
++def sole_vertices_w(env: ManagerBasedRLEnv, foot: str, env_id: int = 0) -> torch.Tensor:
++    """Sole collision vertices [m] of one environment in the world frame, shape ``(V, 3)``."""
++    robot = env.scene["robot"]
++    body = robot.find_bodies(foot)[0][0]
++    pos = robot.data.body_link_pos_w.torch[env_id, body]
++    quat = robot.data.body_link_quat_w.torch[env_id, body]
++    vertices = _sole_vertices(env, foot)
++    return pos + quat_apply(quat.expand(len(vertices), 4), vertices)
++
++
++def sole_support_hull(env: ManagerBasedRLEnv, foot: str, env_id: int = 0) -> torch.Tensor:
++    """World vertices [m] within :data:`SOLE_FACE_TOLERANCE` of a sole's lowest point, shape ``(K, 3)``."""
++    vertices = sole_vertices_w(env, foot, env_id)
++    return vertices[vertices[:, 2] <= vertices[:, 2].min() + SOLE_FACE_TOLERANCE]
++
++
++def _convex_hull(points: list[tuple[float, float]]) -> list[tuple[float, float]]:
++    """Counter-clockwise convex hull (Andrew's monotone chain), without collinear points."""
++    points = sorted(set(points))
++    if len(points) < 3:
++        return points
++
++    def cross(o, a, b):
++        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
++
++    lower, upper = [], []
++    for p in points:
++        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
++            lower.pop()
++        lower.append(p)
++    for p in reversed(points):
++        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
++            upper.pop()
++        upper.append(p)
++    return lower[:-1] + upper[:-1]
++
++
++def polygon_signed_distance(point: torch.Tensor, points: torch.Tensor) -> torch.Tensor:
++    """Distance [m] from ``point`` (2,) to the convex hull of ``points`` (K, 2): positive inside, negative outside."""
++    hull = torch.tensor(_convex_hull([tuple(p) for p in points.tolist()]), dtype=point.dtype, device=point.device)
++    start, end = hull, torch.roll(hull, -1, dims=0)
++    edge = end - start
++    t = (((point - start) * edge).sum(dim=1) / edge.square().sum(dim=1)).clamp(0.0, 1.0)
++    distance = (start + t[:, None] * edge - point).norm(dim=1).min()
++    rel = point - start
++    inside = (edge[:, 0] * rel[:, 1] - edge[:, 1] * rel[:, 0] >= 0.0).all()
++    return distance if inside else -distance
++
++
++@dataclass
++class Placement:
++    """Root orientation (x, y, z, w) and height [m] that put a stance sole flat on the floor."""
++
++    quat: torch.Tensor
++    z: float
++    roll_deg: float
++    pitch_deg: float
++
++
++def solve_flat_sole_placement(env: ManagerBasedRLEnv, pose: list[float], stance: str) -> Placement:
++    """Trunk roll, pitch and height that put the ``stance`` ("right" or "left") sole flat on the floor in ``pose``.
++
++    Yaw is zero. Leaves environment 0 placed accordingly.
++    """
++    robot = env.scene["robot"]
++    foot = f"ankle_{stance}"
++    body = robot.find_bodies(foot)[0][0]
++    identity = torch.tensor([[0.0, 0.0, 0.0, 1.0]], device=env.device)
++    lift = 0.5
++    place_robot(env, pose, identity, lift)
++    normal, _ = sole_normal_in_ankle(env, foot)
++    # Sole normal in the trunk frame; the trunk must turn it straight down.
++    v = quat_apply(robot.data.body_link_quat_w.torch[0:1, body], normal[None])[0]
++    down = torch.tensor([0.0, 0.0, -1.0], device=env.device)
++    axis = torch.linalg.cross(v, down)
++    angle = torch.atan2(axis.norm(), v @ down)
++    axis = axis / axis.norm().clamp(min=1e-12)
++    half = 0.5 * angle
++    quat = torch.cat([axis * torch.sin(half), torch.cos(half)[None]])[None]
++    roll, pitch, _ = euler_xyz_from_quat(quat)
++    quat = quat_from_euler_xyz(roll, pitch, torch.zeros_like(roll))
++    place_robot(env, pose, quat, lift)
++    lowest = (sole_vertices_w(env, foot)[:, 2] - env.scene.env_origins[0, 2]).min().item()
++    z = lift - lowest
++    place_robot(env, pose, quat, z)
++    return Placement(quat=quat, z=z, roll_deg=math.degrees(roll.item()), pitch_deg=math.degrees(pitch.item()))
++
++
++@dataclass
++class PoseMeasurement:
++    """Geometry of environment 0 standing on one foot, as validated upstream."""
++
++    roll_deg: float
++    pitch_deg: float
++    z: float
++    gravity_b: list[float]
++    com_to_stance_site: float
++    com_hull_margin: float
++    lifted_site_z: float
++    lifted_sole_min_z: float
++    stance_sole_min_z: float
++    stance_sole_tilt_deg: float
++    min_joint_limit_margin: float
++    min_joint_limit_joint: str
++
++
++def measure_pose(env: ManagerBasedRLEnv, pose: list[float], stance: str) -> PoseMeasurement:
++    """Measure environment 0 as currently placed, for joint ``pose`` standing on the ``stance`` foot."""
++    robot = env.scene["robot"]
++    lifted = "left" if stance == "right" else "right"
++    stance_foot, lifted_foot = f"ankle_{stance}", f"ankle_{lifted}"
++    origin_z = env.scene.env_origins[0, 2].item()
++    bodies = robot.find_bodies([stance_foot, lifted_foot], preserve_order=True)[0]
++    sites = mdp.foot_site_pos_w(robot, bodies)[0]
++    com_xy = mdp.robot_com_pos_w(robot)[0, :2]
++    hull = sole_support_hull(env, stance_foot)
++
++    normal, _ = sole_normal_in_ankle(env, stance_foot)
++    normal_w = quat_apply(robot.data.body_link_quat_w.torch[0:1, bodies[0]], normal[None])[0]
++    tilt = torch.acos((-normal_w[2]).clamp(-1.0, 1.0))
++
++    joint_ids = servo_joint_ids(env)
++    limits = robot.data.joint_pos_limits.torch[0, joint_ids]
++    q = torch.tensor(pose, device=env.device)
++    margins = torch.minimum(q - limits[:, 0], limits[:, 1] - q)
++    worst = int(margins.argmin())
++
++    roll, pitch, _ = euler_xyz_from_quat(robot.data.root_link_quat_w.torch[0:1])
++    return PoseMeasurement(
++        roll_deg=math.degrees(roll.item()),
++        pitch_deg=math.degrees(pitch.item()),
++        z=robot.data.root_link_pos_w.torch[0, 2].item() - origin_z,
++        gravity_b=robot.data.projected_gravity_b.torch[0].tolist(),
++        com_to_stance_site=(com_xy - sites[0, :2]).norm().item(),
++        com_hull_margin=polygon_signed_distance(com_xy, hull[:, :2]).item(),
++        lifted_site_z=sites[1, 2].item() - origin_z,
++        lifted_sole_min_z=sole_vertices_w(env, lifted_foot)[:, 2].min().item() - origin_z,
++        stance_sole_min_z=sole_vertices_w(env, stance_foot)[:, 2].min().item() - origin_z,
++        stance_sole_tilt_deg=math.degrees(tilt.item()),
++        min_joint_limit_margin=margins[worst].item(),
++        min_joint_limit_joint=MICRODUCK_JOINT_NAMES[worst],
++    )
+diff --git a/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_pose.py b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_pose.py
+new file mode 100644
+index 000000000..2927fc97e
+--- /dev/null
++++ b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_pose.py
+@@ -0,0 +1,52 @@
++# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
++# All rights reserved.
++#
++# SPDX-License-Identifier: BSD-3-Clause
++
++"""The one-foot "flamingo" pose of pollen-robotics/microduck_rl, reproduced on Newton MJWarp.
++
++Values are copied from ``src/mjlab_microduck/tasks/microduck_flamingo_env_cfg.py`` and
++``docs/superpowers/specs/2026-08-28-flamingo-design.md`` on the upstream ``flamingo`` branch (``4757d6ae``).
++Joint values follow :data:`~isaaclab_assets.robots.microduck.MICRODUCK_JOINT_NAMES`: left leg, neck and head,
++right leg.
++"""
++
++import math
++
++FLAMINGO_POSE_RIGHT: list[float] = [
++    *[0.000, 0.300, 1.200, -0.800, 0.800],  # left leg (lifted): swung forward
++    *[0.349, 0.350, -1.500, 0.000],  # neck and head: beak turned toward the stance side
++    *[0.386, -0.334, 0.258, 0.005, -0.253],  # right leg (stance): yawed, rolled, slight forward lean
++]
++"""Joint positions [rad] of the pose standing on the right foot, every joint at least 3 deg inside its range."""
++
++FLAMINGO_BASE_ROLL = math.radians(22.6)
++"""Upstream trunk roll [rad] with the right sole flat on the floor."""
++
++FLAMINGO_BASE_PITCH = math.radians(-8.9)
++"""Upstream trunk pitch [rad] with the right sole flat on the floor."""
++
++FLAMINGO_Z = 0.120
++"""Upstream trunk height [m] with the right sole flat on the floor."""
++
++FLAMINGO_GRAVITY_B = (-0.154, -0.379, -0.912)
++"""Upstream gravity direction in the trunk frame at the right-stance pose."""
++
++FLAMINGO_COM_MARGIN = 0.0121
++"""Upstream distance [m] of the whole-robot CoM inside the stance sole's contact hull."""
++
++
++def mirror_pose(pose: list[float]) -> list[float]:
++    """Return the pose standing on the other foot.
++
++    The right-leg joint axes are the negatives of the left-leg ones, so the legs swap with every leg joint negated;
++    the head keeps its pitches and negates yaw and roll.
++    """
++    left_leg = [-v for v in pose[9:14]]
++    right_leg = [-v for v in pose[0:5]]
++    head = [pose[5], pose[6], -pose[7], -pose[8]]
++    return [v + 0.0 for v in left_leg + head + right_leg]
++
++
++FLAMINGO_POSE_LEFT: list[float] = mirror_pose(FLAMINGO_POSE_RIGHT)
++"""Joint positions [rad] of the pose standing on the left foot."""
+diff --git a/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/mdp/__init__.pyi b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/mdp/__init__.pyi
+index 49666d2fa..2852c1d10 100644
+--- a/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/mdp/__init__.pyi
++++ b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/mdp/__init__.pyi
+@@ -19,6 +19,10 @@ __all__ = [
+     # events
+     "randomize_bam_friction",
+     "randomize_encoder_bias",
++    # flamingo
++    "MICRODUCK_FOOT_SITE_OFFSET",
++    "foot_site_pos_w",
++    "robot_com_pos_w",
+     # observations
+     "ImuNoiseCfg",
+     "foot_air_time_safe",
+@@ -62,6 +66,7 @@ from .commands import (
+ )
+ from .curriculums import microduck_terrain_levels, staged_value
+ from .events import randomize_bam_friction, randomize_encoder_bias
++from .flamingo import MICRODUCK_FOOT_SITE_OFFSET, foot_site_pos_w, robot_com_pos_w
+ from .observations import (
+     ImuNoiseCfg,
+     foot_air_time_safe,
+diff --git a/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/mdp/flamingo.py b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/mdp/flamingo.py
+new file mode 100644
+index 000000000..9469607ee
+--- /dev/null
++++ b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/mdp/flamingo.py
+@@ -0,0 +1,42 @@
++# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
++# All rights reserved.
++#
++# SPDX-License-Identifier: BSD-3-Clause
++
++"""Whole-robot and foot-site measurements for the one-foot flamingo task."""
++
++from __future__ import annotations
++
++from collections.abc import Sequence
++from typing import TYPE_CHECKING
++
++import torch
++
++from isaaclab.utils.math import quat_apply
++
++if TYPE_CHECKING:
++    from isaaclab.assets import Articulation
++
++MICRODUCK_FOOT_SITE_OFFSET = (0.0, -0.02381, -0.01409)
++"""Position [m] of the ``left_foot`` / ``right_foot`` sites in their ankle frames, identical in the MJCF and USD."""
++
++
++def robot_com_pos_w(asset: Articulation) -> torch.Tensor:
++    """Whole-robot center of mass [m] in the world frame, shape ``(num_envs, 3)``.
++
++    The mass-weighted mean of the body CoMs, which matches MuJoCo's root ``subtree_com``. The root link's own CoM
++    is centimeters away from it with the heavy head and a lifted leg.
++    """
++    mass = asset.data.body_mass.torch
++    com = asset.data.body_com_pos_w.torch
++    return (mass.unsqueeze(-1) * com).sum(dim=1) / mass.sum(dim=1, keepdim=True)
++
++
++def foot_site_pos_w(
++    asset: Articulation, body_ids: Sequence[int], offset: tuple[float, float, float] = MICRODUCK_FOOT_SITE_OFFSET
++) -> torch.Tensor:
++    """World positions [m] of the foot sites of ankle bodies ``body_ids``, shape ``(num_envs, len(body_ids), 3)``."""
++    pos = asset.data.body_link_pos_w.torch[:, body_ids]
++    quat = asset.data.body_link_quat_w.torch[:, body_ids]
++    local = torch.tensor(offset, device=pos.device, dtype=pos.dtype).expand_as(pos)
++    return pos + quat_apply(quat, local)
+diff --git a/source/isaaclab_tasks/test/test_microduck_flamingo.py b/source/isaaclab_tasks/test/test_microduck_flamingo.py
+new file mode 100644
+index 000000000..b3886b6bb
+--- /dev/null
++++ b/source/isaaclab_tasks/test/test_microduck_flamingo.py
+@@ -0,0 +1,132 @@
++# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
++# All rights reserved.
++#
++# SPDX-License-Identifier: BSD-3-Clause
++
++"""MicroDuck flamingo reproduction: the one-foot pose, whole-robot CoM, support hulls, and pose placement."""
++
++import math
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from isaaclab.sim import SimulationContext
++from isaaclab.test.utils import DeviceScope, test_devices
++
++import isaaclab_tasks  # noqa: F401
++from isaaclab_tasks.contrib.microduck import mdp
++from isaaclab_tasks.contrib.microduck.flamingo_checks import (
++    make_check_env,
++    measure_pose,
++    place_robot,
++    polygon_signed_distance,
++    sole_support_hull,
++    solve_flat_sole_placement,
++)
++from isaaclab_tasks.contrib.microduck.flamingo_pose import FLAMINGO_POSE_LEFT, FLAMINGO_POSE_RIGHT, mirror_pose
++
++from isaaclab_assets.robots.microduck import MICRODUCK_JOINT_NAMES
++
++
++def test_mirrored_pose_swaps_the_legs_and_flips_head_yaw_and_roll():
++    assert mirror_pose(mirror_pose(FLAMINGO_POSE_RIGHT)) == pytest.approx(FLAMINGO_POSE_RIGHT)
++    # microduck_flamingo_cycle_env_cfg.mirror_pose applied to FLAMINGO_POSE by hand.
++    expected = [
++        *[-0.386, 0.334, -0.258, -0.005, 0.253],
++        *[0.349, 0.350, 1.500, 0.000],
++        *[0.000, -0.300, -1.200, 0.800, -0.800],
++    ]
++    assert pytest.approx(expected) == FLAMINGO_POSE_LEFT
++
++
++def test_polygon_signed_distance_is_positive_inside_and_negative_outside():
++    square = torch.tensor([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0], [0.5, 0.5]])
++    points = torch.tensor([[0.5, 0.5], [0.9, 0.5], [1.5, 0.5], [0.5, 0.0], [2.0, 2.0]])
++    expected = torch.tensor([0.5, 0.1, -0.5, 0.0, -math.sqrt(2.0)])
++    distance = torch.stack([polygon_signed_distance(p, square) for p in points])
++    torch.testing.assert_close(distance, expected)
++
++
++def test_robot_com_is_the_mass_weighted_mean_of_body_coms():
++    mass = torch.tensor([[1.0, 3.0]])
++    com = torch.tensor([[[0.0, 0.0, 0.0], [4.0, 0.0, 2.0]]])
++    asset = SimpleNamespace(
++        data=SimpleNamespace(body_mass=SimpleNamespace(torch=mass), body_com_pos_w=SimpleNamespace(torch=com))
++    )
++    torch.testing.assert_close(mdp.robot_com_pos_w(asset), torch.tensor([[3.0, 0.0, 1.5]]))
++
++
++@pytest.fixture(scope="module")
++def check_env():
++    device = test_devices(DeviceScope.CUDA)[0]
++    env = make_check_env(device=device)
++    yield env
++    env.close()
++    SimulationContext.clear_instance()
++
++
++@pytest.mark.integration
++@pytest.mark.kitless
++def test_check_env_uses_the_all_collisions_robot_without_backlash(check_env):
++    robot = check_env.scene["robot"]
++    assert check_env.cfg.scene.robot.spawn.usd_path.endswith("microduck_allcollisions.usd")
++    assert not any(name.startswith("passive_") for name in robot.joint_names)
++    assert check_env.cfg.events.push_robot is None
++    # Upstream mjlab runs MuJoCo Warp's own collision detection; so does the check.
++    assert check_env.cfg.sim.physics.solver_cfg.use_mujoco_contacts
++    assert check_env.cfg.sim.physics.collision_cfg is None
++
++
++@pytest.mark.integration
++@pytest.mark.kitless
++def test_placement_writes_the_requested_root_pose_and_joints(check_env):
++    robot = check_env.scene["robot"]
++    check_env.reset()
++    quat = torch.tensor([[0.0, 0.0, math.sin(0.2), math.cos(0.2)]], device=check_env.device)
++    place_robot(check_env, FLAMINGO_POSE_RIGHT, quat, 0.3)
++    joint_ids = robot.find_joints(MICRODUCK_JOINT_NAMES, preserve_order=True)[0]
++    torch.testing.assert_close(
++        robot.data.joint_pos.torch[0, joint_ids], torch.tensor(FLAMINGO_POSE_RIGHT, device=check_env.device)
++    )
++    torch.testing.assert_close(robot.data.root_link_quat_w.torch, quat)
++    assert robot.data.root_link_pos_w.torch[0, 2].item() == pytest.approx(0.3, abs=1e-6)
++    # Forward kinematics follow the write: the lifted left foot is well above the right one.
++    feet = robot.find_bodies(["ankle_left", "ankle_right"], preserve_order=True)[0]
++    left_z, right_z = robot.data.body_link_pos_w.torch[0, feet, 2].tolist()
++    assert left_z - right_z > 0.03
++
++
++@pytest.mark.integration
++@pytest.mark.kitless
++def test_home_stance_is_level_with_the_com_inside_both_soles(check_env):
++    """Sign and frame sanity of the measurements on the default two-foot stance."""
++    check_env.reset()
++    robot = check_env.scene["robot"]
++    home = robot.data.default_joint_pos.torch[0, robot.find_joints(MICRODUCK_JOINT_NAMES, preserve_order=True)[0]]
++    identity = torch.tensor([[0.0, 0.0, 0.0, 1.0]], device=check_env.device)
++    place_robot(check_env, home.tolist(), identity, 0.2)
++    gravity = robot.data.projected_gravity_b.torch[0]
++    torch.testing.assert_close(gravity, torch.tensor([0.0, 0.0, -1.0], device=check_env.device), atol=0.1, rtol=0)
++    hull = torch.cat([sole_support_hull(check_env, foot) for foot in ("ankle_left", "ankle_right")])
++    com_xy = mdp.robot_com_pos_w(robot)[0, :2]
++    assert polygon_signed_distance(com_xy, hull[:, :2]) > 0.0
++
++
++@pytest.mark.integration
++@pytest.mark.kitless
++@pytest.mark.parametrize("stance", ["right", "left"])
++def test_flat_sole_placement_puts_the_stance_sole_on_the_ground(check_env, stance):
++    pose = FLAMINGO_POSE_RIGHT if stance == "right" else FLAMINGO_POSE_LEFT
++    check_env.reset()
++    placement = solve_flat_sole_placement(check_env, pose, stance)
++    place_robot(check_env, pose, placement.quat, placement.z)
++    measured = measure_pose(check_env, pose, stance)
++    assert measured.stance_sole_min_z == pytest.approx(0.0, abs=1e-4)
++    assert measured.stance_sole_tilt_deg < 0.5
++    assert measured.lifted_sole_min_z > 0.03
++    # The pose stays 0.05 rad off every hard limit (upstream test plan). Upstream checks against ranges rounded to
++    # 0.384 rad; the 22 deg hip-roll limit leaves 0.04997 rad, so the comparison allows 1e-4 rad of rounding.
++    assert measured.min_joint_limit_margin >= 0.05 - 1e-4
++    # Leaning over the stance foot rolls the trunk toward it.
++    assert math.copysign(1.0, measured.roll_deg) == (1.0 if stance == "right" else -1.0)
+-- 
+2.43.0
+

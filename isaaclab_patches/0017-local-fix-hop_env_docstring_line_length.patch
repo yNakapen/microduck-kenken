@@ -1,0 +1,33 @@
+From 6417a22c3abcb8ada5e553e67fa6d75f9d37aa75 Mon Sep 17 00:00:00 2001
+From: Nakapen <nakapen@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 07:59:47 +0900
+Subject: [PATCH 17/19] #local fix:hop_env_docstring_line_length
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+flamingo_hop_env_cfg の docstring の行長を 120 以内に直す（ruff E501）。動作の変更なし。
+---
+ .../contrib/microduck/flamingo_hop_env_cfg.py               | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_hop_env_cfg.py b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_hop_env_cfg.py
+index efd793893..92c867588 100644
+--- a/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_hop_env_cfg.py
++++ b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_hop_env_cfg.py
+@@ -7,9 +7,9 @@
+ 
+ Fine-tunes the flamingo stage-1 policy: the robot spawns in the one-foot pose, and the twist slots carry
+ ``[0, 0, hop]`` from :class:`~isaaclab_tasks.contrib.microduck.mdp.HopCommand`, alternating a still stand and hopping.
+-While hopping the stance foot must leave the floor and land again with the lifted foot up from before the takeoff (40 to 120 ms
+-flights are paid), may not stay
+-down longer than 0.4 s, and the trunk must stay in place; the still-stand terms fade out over the 0.3 s blend and back.
++While hopping the stance foot must leave the floor and land again with the lifted foot up from before the takeoff
++(40 to 120 ms flights are paid), may not stay down longer than 0.4 s, and the trunk must stay in place; the
++still-stand terms fade out over the 0.3 s blend and back.
+ The stage-1 schedules start at their final values, with 0.15 m/s pushes throughout.
+ """
+ 
+-- 
+2.43.0
+

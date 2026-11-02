@@ -1,0 +1,177 @@
+From da42bf0082ed6ffe20c3ff06a3f0175ecf9e2dbb Mon Sep 17 00:00:00 2001
+From: Nakapen <nakapen@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 08:44:52 +0900
+Subject: [PATCH 19/19] #local update:hop_phase_drops_still_rewards
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+ケンケン区間では、静止しているほうが得になる swing_foot_clear・pose_flamingo・gravity_flamingo・action_rate_l2 を (1-β) で無効にする（β は 0.3 s で 1 に達し、以降は 0。stance_foot_grounded と stillness は既に同じ扱い）。それぞれ still_* の関数を追加。
+---
+ .../contrib/microduck/flamingo_hop_env_cfg.py |  9 ++++
+ .../contrib/microduck/mdp/__init__.pyi        |  8 ++++
+ .../contrib/microduck/mdp/flamingo_hop.py     | 45 ++++++++++++++++++-
+ .../test/test_microduck_flamingo_hop.py       | 30 +++++++++++++
+ 4 files changed, 91 insertions(+), 1 deletion(-)
+
+diff --git a/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_hop_env_cfg.py b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_hop_env_cfg.py
+index 11587548f..dec5c826a 100644
+--- a/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_hop_env_cfg.py
++++ b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_hop_env_cfg.py
+@@ -81,6 +81,15 @@ class FlamingoHopRewardsCfg(FlamingoRewardsCfg):
+         self.stance_foot_grounded.params = {"command_name": _COMMAND, **self.stance_foot_grounded.params}
+         self.stillness.func = mdp.still_joint_vel_gaussian
+         self.stillness.params = {"command_name": _COMMAND, **self.stillness.params}
++        # Terms that pay for keeping still are off while hopping, too.
++        self.swing_foot_clear.func = mdp.still_foot_site_height_gaussian
++        self.swing_foot_clear.params = {"command_name": _COMMAND, **self.swing_foot_clear.params}
++        self.pose_flamingo.func = mdp.still_pose_target_match
++        self.pose_flamingo.params = {"command_name": _COMMAND, **self.pose_flamingo.params}
++        self.gravity_flamingo.func = mdp.still_projected_gravity_match
++        self.gravity_flamingo.params = {"command_name": _COMMAND, **self.gravity_flamingo.params}
++        self.action_rate_l2.func = mdp.still_action_rate_l2
++        self.action_rate_l2.params = {"command_name": _COMMAND}
+         # microduck_rl's Ballet v2 triples the lifted-foot tax against a tapping or parked foot.
+         self.swing_foot_touch.weight = -1.5
+         # The stage-1 schedules at their final values.
+diff --git a/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/mdp/__init__.pyi b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/mdp/__init__.pyi
+index 71614e2b1..406126e78 100644
+--- a/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/mdp/__init__.pyi
++++ b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/mdp/__init__.pyi
+@@ -53,8 +53,12 @@ __all__ = [
+     "hop_drift_cost",
+     "hop_ground_time_cost",
+     "hop_wait_cost",
++    "still_action_rate_l2",
+     "still_foot_in_contact",
++    "still_foot_site_height_gaussian",
+     "still_joint_vel_gaussian",
++    "still_pose_target_match",
++    "still_projected_gravity_match",
+     # observations
+     "ImuNoiseCfg",
+     "foot_air_time_safe",
+@@ -134,8 +138,12 @@ from .flamingo_hop import (
+     hop_drift_cost,
+     hop_ground_time_cost,
+     hop_wait_cost,
++    still_action_rate_l2,
+     still_foot_in_contact,
++    still_foot_site_height_gaussian,
+     still_joint_vel_gaussian,
++    still_pose_target_match,
++    still_projected_gravity_match,
+ )
+ from .observations import (
+     ImuNoiseCfg,
+diff --git a/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/mdp/flamingo_hop.py b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/mdp/flamingo_hop.py
+index 1e6d54189..6008c5071 100644
+--- a/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/mdp/flamingo_hop.py
++++ b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/mdp/flamingo_hop.py
+@@ -20,7 +20,13 @@ import torch
+ from isaaclab.managers import CommandTerm, CommandTermCfg, SceneEntityCfg
+ from isaaclab.utils.configclass import configclass
+ 
+-from .flamingo import foot_in_contact, joint_vel_gaussian
++from .flamingo import (
++    foot_in_contact,
++    foot_site_height_gaussian,
++    joint_vel_gaussian,
++    pose_target_match,
++    projected_gravity_match,
++)
+ from .observations import zero_non_finite
+ 
+ if TYPE_CHECKING:
+@@ -189,3 +195,40 @@ def still_joint_vel_gaussian(
+ ) -> torch.Tensor:
+     """:func:`joint_vel_gaussian`, faded out while hopping."""
+     return (1.0 - _beta(env, command_name)) * joint_vel_gaussian(env, std, asset_cfg, gate_sensor_cfg)
++
++
++def still_foot_site_height_gaussian(
++    env: ManagerBasedRLEnv,
++    command_name: str,
++    target: float,
++    std: float,
++    asset_cfg: SceneEntityCfg,
++    gate_sensor_cfg: SceneEntityCfg | None = None,
++) -> torch.Tensor:
++    """:func:`foot_site_height_gaussian`, faded out while hopping."""
++    reward = foot_site_height_gaussian(env, target, std, asset_cfg, gate_sensor_cfg)
++    return (1.0 - _beta(env, command_name)) * reward
++
++
++def still_pose_target_match(
++    env: ManagerBasedRLEnv, command_name: str, target: Sequence[float], std: float, asset_cfg: SceneEntityCfg
++) -> torch.Tensor:
++    """:func:`pose_target_match`, faded out while hopping."""
++    return (1.0 - _beta(env, command_name)) * pose_target_match(env, target, std, asset_cfg)
++
++
++def still_projected_gravity_match(
++    env: ManagerBasedRLEnv,
++    command_name: str,
++    target: tuple[float, float, float],
++    std: float,
++    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
++) -> torch.Tensor:
++    """:func:`projected_gravity_match`, faded out while hopping."""
++    return (1.0 - _beta(env, command_name)) * projected_gravity_match(env, target, std, asset_cfg)
++
++
++def still_action_rate_l2(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
++    """Squared change of the policy actions, faded out while hopping."""
++    rate = env.action_manager.action - env.action_manager.prev_action
++    return (1.0 - _beta(env, command_name)) * (rate**2).sum(dim=1)
+diff --git a/source/isaaclab_tasks/test/test_microduck_flamingo_hop.py b/source/isaaclab_tasks/test/test_microduck_flamingo_hop.py
+index 39ddd2aca..488dfa1be 100644
+--- a/source/isaaclab_tasks/test/test_microduck_flamingo_hop.py
++++ b/source/isaaclab_tasks/test/test_microduck_flamingo_hop.py
+@@ -193,6 +193,25 @@ def test_still_scaled_terms_fade_out_while_hopping():
+     torch.testing.assert_close(reward, torch.tensor([1.0, 0.5, 0.0]))
+ 
+ 
++def test_still_action_rate_fades_out_while_hopping():
++    env = _fake_env(beta=[0.0, 0.5, 1.0])
++    env.action_manager = SimpleNamespace(action=torch.ones(3, 2), prev_action=torch.zeros(3, 2))
++    torch.testing.assert_close(mdp.still_action_rate_l2(env, "base_velocity"), torch.tensor([2.0, 1.0, 0.0]))
++
++
++def test_still_gravity_and_pose_matches_fade_out_while_hopping():
++    env = _fake_env(beta=[0.0, 1.0])
++    robot = env.scene["robot"]
++    robot.data.projected_gravity_b = SimpleNamespace(torch=torch.tensor([[0.0, 0.0, -1.0]] * 2))
++    robot.data.joint_pos = SimpleNamespace(torch=torch.zeros(2, 2))
++    gravity = mdp.still_projected_gravity_match(env, "base_velocity", target=(0.0, 0.0, -1.0), std=0.15)
++    torch.testing.assert_close(gravity, torch.tensor([1.0, 0.0]))
++    pose = mdp.still_pose_target_match(
++        env, "base_velocity", target=[0.0, 0.0], std=0.5, asset_cfg=SceneEntityCfg("robot", joint_ids=[0, 1])
++    )
++    torch.testing.assert_close(pose, torch.tensor([1.0, 0.0]))
++
++
+ """
+ Environment.
+ """
+@@ -255,6 +274,17 @@ def test_hop_rewards(hop_env):
+     assert manager.get_term_cfg("hop_air_time").params["swing_sensor_cfg"].body_names == ["ankle_left"]
+     # The swing foot must be up 0.1 s before the takeoff: the first policy pushed off with it 93 % of the time.
+     assert manager.get_term_cfg("hop_air_time").params["swing_lead_time"] == 0.1
++    # Terms that pay for keeping still are off while hopping.
++    still_funcs = {
++        "stance_foot_grounded": mdp.still_foot_in_contact,
++        "stillness": mdp.still_joint_vel_gaussian,
++        "swing_foot_clear": mdp.still_foot_site_height_gaussian,
++        "pose_flamingo": mdp.still_pose_target_match,
++        "gravity_flamingo": mdp.still_projected_gravity_match,
++        "action_rate_l2": mdp.still_action_rate_l2,
++    }
++    for name, func in still_funcs.items():
++        assert manager.get_term_cfg(name).func is func, name
+ 
+ 
+ @pytest.mark.integration
+-- 
+2.43.0
+

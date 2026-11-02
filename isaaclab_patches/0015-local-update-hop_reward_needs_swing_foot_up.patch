@@ -1,0 +1,143 @@
+From c7a40f59472adb124a7bee8fb3d788e6ec5ebd4b Mon Sep 17 00:00:00 2001
+From: Nakapen <nakapen@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 07:20:49 +0900
+Subject: [PATCH 15/19] #local update:hop_reward_needs_swing_foot_up
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+ケンケンの跳躍報酬を、上げた足の空中時間が立ち足の今回の滞空時間以上のとき（飛行中も着地時も上げた足が床に触れていないとき）だけ与える。初回の学習（4998 it）は跳躍 平均 7 回・静止 2.45 s を満たしたが、着地のたびに上げた足の縁が床に触れ（接触開始時の site 高さ 18-35 mm、自己衝突 0/460）、99.8% のエピソードで不合格だった。
+---
+ .../contrib/microduck/flamingo_hop_env_cfg.py |  6 ++++-
+ .../contrib/microduck/mdp/flamingo_hop.py     | 17 ++++++++++--
+ .../test/test_microduck_flamingo_hop.py       | 27 +++++++++++++++++--
+ 3 files changed, 45 insertions(+), 5 deletions(-)
+
+diff --git a/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_hop_env_cfg.py b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_hop_env_cfg.py
+index 265d8510c..b64741670 100644
+--- a/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_hop_env_cfg.py
++++ b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_hop_env_cfg.py
+@@ -7,7 +7,8 @@
+ 
+ Fine-tunes the flamingo stage-1 policy: the robot spawns in the one-foot pose, and the twist slots carry
+ ``[0, 0, hop]`` from :class:`~isaaclab_tasks.contrib.microduck.mdp.HopCommand`, alternating a still stand and hopping.
+-While hopping the stance foot must leave the floor and land again (40 to 120 ms flights are paid), may not stay
++While hopping the stance foot must leave the floor and land again with the lifted foot still up (40 to 120 ms
++flights are paid), may not stay
+ down longer than 0.4 s, and the trunk must stay in place; the still-stand terms fade out over the 0.3 s blend and back.
+ The stage-1 schedules start at their final values, with 0.15 m/s pushes throughout.
+ """
+@@ -27,6 +28,7 @@ from .flamingo_env_cfg import (
+ 
+ _COMMAND = "base_velocity"
+ _STANCE_SENSOR_CFG = SceneEntityCfg("contact_forces", body_names=["ankle_right"])
++_SWING_SENSOR_CFG = SceneEntityCfg("contact_forces", body_names=["ankle_left"])
+ 
+ FLAMINGO_HOP_MIN_AIR_TIME = 0.04
+ """Flight [s] below which a stance-foot landing earns nothing; contact flicker stays under it."""
+@@ -55,6 +57,8 @@ class FlamingoHopRewardsCfg(FlamingoRewardsCfg):
+             "sensor_cfg": _STANCE_SENSOR_CFG,
+             "min_air_time": FLAMINGO_HOP_MIN_AIR_TIME,
+             "max_air_time": FLAMINGO_HOP_MAX_AIR_TIME,
++            # Without it the first policy landed every hop on both feet.
++            "swing_sensor_cfg": _SWING_SENSOR_CFG,
+         },
+     )
+     hop_ground_time = RewTerm(
+diff --git a/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/mdp/flamingo_hop.py b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/mdp/flamingo_hop.py
+index a8a90e779..b474aa4eb 100644
+--- a/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/mdp/flamingo_hop.py
++++ b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/mdp/flamingo_hop.py
+@@ -106,15 +106,28 @@ def _beta(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
+ 
+ 
+ def hop_air_time(
+-    env: ManagerBasedRLEnv, command_name: str, sensor_cfg: SceneEntityCfg, min_air_time: float, max_air_time: float
++    env: ManagerBasedRLEnv,
++    command_name: str,
++    sensor_cfg: SceneEntityCfg,
++    min_air_time: float,
++    max_air_time: float,
++    swing_sensor_cfg: SceneEntityCfg | None = None,
+ ) -> torch.Tensor:
+     """Score in [0, 1] of the stance foot's flight ending this step while hopping: 0 at ``min_air_time`` [s] or
+     shorter, 1 at ``max_air_time`` [s] or longer. Only flights of the stance foot count, so a tapping swing foot earns
+-    nothing."""
++    nothing.
++
++    With ``swing_sensor_cfg``, a landing pays only when the swing foot has been in the air at least as long as the
++    stance flight, i.e. it stayed up through the flight and the landing instead of landing on both feet.
++    """
+     sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+     landed = sensor.compute_first_contact(env.step_dt).torch[:, sensor_cfg.body_ids].any(dim=1).float()
+     air = zero_non_finite(sensor.data.last_air_time.torch[:, sensor_cfg.body_ids]).max(dim=1).values
+     score = torch.clamp((air - min_air_time) / (max_air_time - min_air_time), 0.0, 1.0)
++    if swing_sensor_cfg is not None:
++        swing_sensor: ContactSensor = env.scene.sensors[swing_sensor_cfg.name]
++        swing_air = zero_non_finite(swing_sensor.data.current_air_time.torch[:, swing_sensor_cfg.body_ids])
++        score = score * (swing_air.min(dim=1).values >= air - 1e-6).float()
+     return _beta(env, command_name) * landed * score
+ 
+ 
+diff --git a/source/isaaclab_tasks/test/test_microduck_flamingo_hop.py b/source/isaaclab_tasks/test/test_microduck_flamingo_hop.py
+index 66edcd0fd..f7544fd03 100644
+--- a/source/isaaclab_tasks/test/test_microduck_flamingo_hop.py
++++ b/source/isaaclab_tasks/test/test_microduck_flamingo_hop.py
+@@ -55,15 +55,20 @@ def test_hop_blend_ramps_over_the_ramp_time_and_a_script_freezes_the_command():
+     assert term.command[0, 2].item() == 1.0
+ 
+ 
+-def _fake_env(beta, contact_time=None, first_contact=None, last_air_time=None, lin_vel=None, ang_vel=None):
++def _fake_env(
++    beta, contact_time=None, first_contact=None, last_air_time=None, lin_vel=None, ang_vel=None, current_air_time=None
++):
+     n = len(beta)
+     term = SimpleNamespace(beta=torch.tensor(beta))
+     contact_time = torch.tensor(contact_time if contact_time is not None else [[0.1]] * n)
+     first = torch.tensor(first_contact if first_contact is not None else [[False]] * n)
+     air = torch.tensor(last_air_time if last_air_time is not None else [[0.0]] * n)
++    current_air = torch.tensor(current_air_time if current_air_time is not None else [[0.0]] * n)
+     sensor = SimpleNamespace(
+         data=SimpleNamespace(
+-            current_contact_time=SimpleNamespace(torch=contact_time), last_air_time=SimpleNamespace(torch=air)
++            current_contact_time=SimpleNamespace(torch=contact_time),
++            last_air_time=SimpleNamespace(torch=air),
++            current_air_time=SimpleNamespace(torch=current_air),
+         ),
+         compute_first_contact=lambda dt: SimpleNamespace(torch=first),
+     )
+@@ -86,6 +91,22 @@ def _fake_env(beta, contact_time=None, first_contact=None, last_air_time=None, l
+ 
+ 
+ _STANCE = SceneEntityCfg("contact_forces", body_ids=[0])
++_SWING = SceneEntityCfg("contact_forces", body_ids=[1])
++
++
++def test_hop_air_time_pays_only_landings_with_the_swing_foot_up_through_the_flight():
++    # Columns [stance, swing]; every row lands after an 80 ms stance flight while hopping. The swing foot has been up
++    # for 1 s, down now, up for only 40 ms (it touched during the flight), and up for exactly the flight.
++    env = _fake_env(
++        beta=[1.0, 1.0, 1.0, 1.0],
++        first_contact=[[True, False]] * 4,
++        last_air_time=[[0.08, 0.0]] * 4,
++        current_air_time=[[0.0, 1.0], [0.0, 0.0], [0.0, 0.04], [0.0, 0.08]],
++    )
++    reward = mdp.hop_air_time(
++        env, "base_velocity", _STANCE, min_air_time=0.04, max_air_time=0.12, swing_sensor_cfg=_SWING
++    )
++    torch.testing.assert_close(reward, torch.tensor([0.5, 0.0, 0.0, 0.5]))
+ 
+ 
+ def test_hop_air_time_pays_landings_of_real_flights_while_hopping():
+@@ -175,6 +196,8 @@ def test_hop_rewards(hop_env):
+     weights = {name: manager.get_term_cfg(name).weight for name in manager.active_terms}
+     assert weights == pytest.approx(expected)
+     assert manager.get_term_cfg("com_over_stance_foot").params["std"] == 0.02
++    # Hops landing on both feet earn nothing.
++    assert manager.get_term_cfg("hop_air_time").params["swing_sensor_cfg"].body_names == ["ankle_left"]
+ 
+ 
+ @pytest.mark.integration
+-- 
+2.43.0
+

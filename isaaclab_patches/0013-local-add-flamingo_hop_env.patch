@@ -1,0 +1,598 @@
+From 6cb8ba62525e78c720eaa6fc893fc782e4b87f0b Mon Sep 17 00:00:00 2001
+From: Nakapen <nakapen@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 00:41:18 +0900
+Subject: [PATCH 13/19] #local add:flamingo_hop_env
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+片足立ち（段階 1）の方策を初期値に、右足でその場ケンケン→片足で静止を学習する
+IsaacContrib-FlamingoHop-Flat-MicroDuck を追加。
+- 指令 HopCommand: twist 枠 [0, 0, hop]。静止 1.5-3 s とケンケン 2-4 s を交互（リセット後は静止から）、
+  β が 0.3 s で hop に追従し報酬を切り替える
+- 報酬: 段階 1 の項（最終値: action_rate -0.5、torque_rate -1e-3、重心 std 0.02）、立ち足の接地と静止は (1-β)、
+  上げた足の接地 -1.5（Ballet v2 にならい 3 倍）、立ち足の滞空 40-120 ms に +30、
+  立ち足の接地 0.4 s 超に -2、水平速度と向きの変化に -4
+- 押し ±0.15 m/s を最初から、CoM の DR も最終値、カリキュラムなし、エピソード 10 s、2000 it
+- 学習は --checkpoint で段階 1 の model_2999.pt から再開（10 it の試験で読み込みを確認）
+---
+ .../changelog.d/hop-local-hop-task.added.rst  |   4 +
+ .../contrib/microduck/__init__.py             |  12 +-
+ .../microduck/agents/rsl_rl_ppo_cfg.py        |   8 +
+ .../contrib/microduck/flamingo_hop_env_cfg.py | 107 ++++++++++
+ .../contrib/microduck/mdp/__init__.pyi        |  17 ++
+ .../contrib/microduck/mdp/flamingo_hop.py     | 156 +++++++++++++++
+ .../test/test_microduck_flamingo_hop.py       | 188 ++++++++++++++++++
+ 7 files changed, 491 insertions(+), 1 deletion(-)
+ create mode 100644 source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_hop_env_cfg.py
+ create mode 100644 source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/mdp/flamingo_hop.py
+ create mode 100644 source/isaaclab_tasks/test/test_microduck_flamingo_hop.py
+
+diff --git a/source/isaaclab_tasks/changelog.d/hop-local-hop-task.added.rst b/source/isaaclab_tasks/changelog.d/hop-local-hop-task.added.rst
+index 7c396f3bd..abe091851 100644
+--- a/source/isaaclab_tasks/changelog.d/hop-local-hop-task.added.rst
++++ b/source/isaaclab_tasks/changelog.d/hop-local-hop-task.added.rst
+@@ -31,3 +31,7 @@
+   ``scripts/reinforcement_learning/microduck/eval_flamingo_cycle.py`` to evaluate MicroDuck flamingo-cycle policies
+   with a scripted stand, lift, hold and lower per stance side, :class:`~isaaclab_tasks.contrib.microduck.mdp.FlamingoCommand`
+   ``set_command`` to script the command, and a ``--cycle`` mode of ``record_flamingo.py``.
++* Added ``IsaacContrib-FlamingoHop-Flat-MicroDuck``, hopping in place on the right foot of the flamingo pose and
++  holding still under pushes, fine-tuned from the flamingo stage-1 policy, with the ``HopCommand`` ``[0, 0, hop]``
++  twist-slot command and the ``hop_air_time``, ``hop_ground_time_cost``, ``hop_drift_cost``,
++  ``still_foot_in_contact`` and ``still_joint_vel_gaussian`` MicroDuck reward terms.
+diff --git a/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/__init__.py b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/__init__.py
+index bcebcc9d0..fc57d0c75 100644
+--- a/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/__init__.py
++++ b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/__init__.py
+@@ -3,7 +3,7 @@
+ #
+ # SPDX-License-Identifier: BSD-3-Clause
+ 
+-"""MicroDuck flat and rough velocity walking, the single-leg stand towards hopping, and one-foot flamingo balance.
++"""MicroDuck flat and rough velocity walking, the single-leg stand towards hopping, one-foot flamingo balance and hopping.
+ 
+ Select the backlash robot with ``presets=backlash``.
+ """
+@@ -40,6 +40,16 @@ gym.register(
+     },
+ )
+ 
++gym.register(
++    id="IsaacContrib-FlamingoHop-Flat-MicroDuck",
++    entry_point="isaaclab.envs:ManagerBasedRLEnv",
++    disable_env_checker=True,
++    kwargs={
++        "env_cfg_entry_point": f"{__name__}.flamingo_hop_env_cfg:MicroDuckFlamingoHopFlatEnvCfg",
++        "rsl_rl_cfg_entry_point": f"{__name__}.agents.rsl_rl_ppo_cfg:MicroDuckFlamingoHopPPORunnerCfg",
++    },
++)
++
+ gym.register(
+     id="IsaacContrib-FlamingoCycle-Flat-MicroDuck",
+     entry_point="isaaclab.envs:ManagerBasedRLEnv",
+diff --git a/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/agents/rsl_rl_ppo_cfg.py b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/agents/rsl_rl_ppo_cfg.py
+index 300a6832d..6c3f7a133 100644
+--- a/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/agents/rsl_rl_ppo_cfg.py
++++ b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/agents/rsl_rl_ppo_cfg.py
+@@ -71,6 +71,14 @@ class MicroDuckFlamingoCyclePPORunnerCfg(MicroDuckFlamingoPPORunnerCfg):
+     experiment_name = "microduck_flamingo_cycle_flat"
+ 
+ 
++@configclass
++class MicroDuckFlamingoHopPPORunnerCfg(MicroDuckFlamingoPPORunnerCfg):
++    """The flamingo recipe for fine-tuning the stage-1 policy to hop; resume it with ``--checkpoint``."""
++
++    max_iterations = 2000
++    experiment_name = "microduck_flamingo_hop_flat"
++
++
+ @configclass
+ class MicroDuckRoughPPORunnerCfg(MicroDuckPPORunnerCfg):
+     """The same PPO recipe with a separate experiment directory for rough terrain."""
+diff --git a/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_hop_env_cfg.py b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_hop_env_cfg.py
+new file mode 100644
+index 000000000..265d8510c
+--- /dev/null
++++ b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_hop_env_cfg.py
+@@ -0,0 +1,107 @@
++# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
++# All rights reserved.
++#
++# SPDX-License-Identifier: BSD-3-Clause
++
++"""Hopping in place on the right foot of the flamingo pose, then holding still, under pushes.
++
++Fine-tunes the flamingo stage-1 policy: the robot spawns in the one-foot pose, and the twist slots carry
++``[0, 0, hop]`` from :class:`~isaaclab_tasks.contrib.microduck.mdp.HopCommand`, alternating a still stand and hopping.
++While hopping the stance foot must leave the floor and land again (40 to 120 ms flights are paid), may not stay
++down longer than 0.4 s, and the trunk must stay in place; the still-stand terms fade out over the 0.3 s blend and back.
++The stage-1 schedules start at their final values, with 0.15 m/s pushes throughout.
++"""
++
++from isaaclab.managers import RewardTermCfg as RewTerm
++from isaaclab.managers import SceneEntityCfg
++from isaaclab.utils.configclass import configclass
++
++from . import mdp
++from .flamingo_env_cfg import (
++    FLAMINGO_MAX_PUSH,
++    FlamingoCommandsCfg,
++    FlamingoEventsCfg,
++    FlamingoRewardsCfg,
++    MicroDuckFlamingoFlatEnvCfg,
++)
++
++_COMMAND = "base_velocity"
++_STANCE_SENSOR_CFG = SceneEntityCfg("contact_forces", body_names=["ankle_right"])
++
++FLAMINGO_HOP_MIN_AIR_TIME = 0.04
++"""Flight [s] below which a stance-foot landing earns nothing; contact flicker stays under it."""
++FLAMINGO_HOP_MAX_AIR_TIME = 0.12
++"""Flight [s] earning the full hop reward, about the 7.4 V jump estimate of the planar hop model (105 ms)."""
++
++
++@configclass
++class FlamingoHopCommandsCfg(FlamingoCommandsCfg):
++    """``[0, 0, hop]`` in the twist slots; the head and body commands of the stage-1 task."""
++
++    base_velocity = mdp.HopCommandCfg(
++        resampling_time_range=(1.5, 3.0), still_time_range=(1.5, 3.0), hop_time_range=(2.0, 4.0), ramp_s=0.3
++    )
++
++
++@configclass
++class FlamingoHopRewardsCfg(FlamingoRewardsCfg):
++    """Stage-1 rewards at their final schedule values, the still-stand terms faded by the hop blend, and hop terms."""
++
++    hop_air_time = RewTerm(
++        func=mdp.hop_air_time,
++        weight=30.0,
++        params={
++            "command_name": _COMMAND,
++            "sensor_cfg": _STANCE_SENSOR_CFG,
++            "min_air_time": FLAMINGO_HOP_MIN_AIR_TIME,
++            "max_air_time": FLAMINGO_HOP_MAX_AIR_TIME,
++        },
++    )
++    hop_ground_time = RewTerm(
++        func=mdp.hop_ground_time_cost,
++        weight=-2.0,
++        params={"command_name": _COMMAND, "sensor_cfg": _STANCE_SENSOR_CFG, "max_contact_time": 0.4},
++    )
++    hop_drift = RewTerm(func=mdp.hop_drift_cost, weight=-4.0, params={"command_name": _COMMAND, "yaw_weight": 0.1})
++
++    def __post_init__(self):
++        self.stance_foot_grounded.func = mdp.still_foot_in_contact
++        self.stance_foot_grounded.params = {"command_name": _COMMAND, **self.stance_foot_grounded.params}
++        self.stillness.func = mdp.still_joint_vel_gaussian
++        self.stillness.params = {"command_name": _COMMAND, **self.stillness.params}
++        # microduck_rl's Ballet v2 triples the lifted-foot tax against a tapping or parked foot.
++        self.swing_foot_touch.weight = -1.5
++        # The stage-1 schedules at their final values.
++        self.action_rate_l2.weight = -0.5
++        self.joint_torque_rate_l2.weight = -1e-3
++        self.com_over_stance_foot.params["std"] = 0.02
++
++
++@configclass
++class FlamingoHopEventsCfg(FlamingoEventsCfg):
++    """Stage-1 spawn and randomization at the final CoM ranges, with full pushes from the start."""
++
++    def __post_init__(self):
++        push = FLAMINGO_MAX_PUSH
++        self.push_robot.params["velocity_range"] = {"x": (-push, push), "y": (-push, push)}
++        self.randomize_com.params["com_range"] = {axis: (-0.015, 0.015) for axis in "xyz"}
++        self.randomize_head_com.params["com_range"] = {axis: (-0.01, 0.01) for axis in "xyz"}
++
++
++@configclass
++class FlamingoHopCurriculumCfg:
++    """No schedules: the fine-tuning starts from the stage-1 final values."""
++
++
++@configclass
++class MicroDuckFlamingoHopFlatEnvCfg(MicroDuckFlamingoFlatEnvCfg):
++    """MicroDuck hopping in place on the right foot and holding still, with Newton MJWarp and BAM servos."""
++
++    commands: FlamingoHopCommandsCfg = FlamingoHopCommandsCfg()
++    rewards: FlamingoHopRewardsCfg = FlamingoHopRewardsCfg()
++    events: FlamingoHopEventsCfg = FlamingoHopEventsCfg()
++    curriculum: FlamingoHopCurriculumCfg = FlamingoHopCurriculumCfg()
++
++    def __post_init__(self):
++        super().__post_init__()
++        self.episode_length_s = 10.0
+diff --git a/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/mdp/__init__.pyi b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/mdp/__init__.pyi
+index 321d2caea..a84c1deed 100644
+--- a/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/mdp/__init__.pyi
++++ b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/mdp/__init__.pyi
+@@ -46,6 +46,14 @@ __all__ = [
+     "cycle_swing_foot_clear",
+     "cycle_swing_foot_contact",
+     "reset_flamingo_cycle_pose",
++    # flamingo hop
++    "HopCommand",
++    "HopCommandCfg",
++    "hop_air_time",
++    "hop_drift_cost",
++    "hop_ground_time_cost",
++    "still_foot_in_contact",
++    "still_joint_vel_gaussian",
+     # observations
+     "ImuNoiseCfg",
+     "foot_air_time_safe",
+@@ -118,6 +126,15 @@ from .flamingo_cycle import (
+     cycle_swing_foot_contact,
+     reset_flamingo_cycle_pose,
+ )
++from .flamingo_hop import (
++    HopCommand,
++    HopCommandCfg,
++    hop_air_time,
++    hop_drift_cost,
++    hop_ground_time_cost,
++    still_foot_in_contact,
++    still_joint_vel_gaussian,
++)
+ from .observations import (
+     ImuNoiseCfg,
+     foot_air_time_safe,
+diff --git a/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/mdp/flamingo_hop.py b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/mdp/flamingo_hop.py
+new file mode 100644
+index 000000000..a8a90e779
+--- /dev/null
++++ b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/mdp/flamingo_hop.py
+@@ -0,0 +1,156 @@
++# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
++# All rights reserved.
++#
++# SPDX-License-Identifier: BSD-3-Clause
++
++"""Command and rewards of hopping in place on the stance foot of the flamingo pose.
++
++The command occupies the twist slots as ``[0, 0, hop]``: 1 asks for hopping, 0 for a still one-foot stand. An
++internal blend ``beta`` follows the hop flag over a short ramp and gates the rewards, so the policy only sees the raw
++flag. Penalties are non-negative costs for negative weights.
++"""
++
++from __future__ import annotations
++
++from collections.abc import Sequence
++from typing import TYPE_CHECKING
++
++import torch
++
++from isaaclab.managers import CommandTerm, CommandTermCfg, SceneEntityCfg
++from isaaclab.utils.configclass import configclass
++
++from .flamingo import foot_in_contact, joint_vel_gaussian
++from .observations import zero_non_finite
++
++if TYPE_CHECKING:
++    from isaaclab.assets import Articulation
++    from isaaclab.envs import ManagerBasedRLEnv
++    from isaaclab.sensors import ContactSensor
++
++
++class HopCommand(CommandTerm):
++    """``[0, 0, hop]`` alternating a still stand and hopping, starting still after every reset.
++
++    Each phase lasts a time drawn from ``still_time_range`` or ``hop_time_range``. :attr:`beta` slews toward the hop
++    flag over ``ramp_s`` seconds.
++    """
++
++    cfg: HopCommandCfg
++
++    def __init__(self, cfg: HopCommandCfg, env: ManagerBasedRLEnv):
++        super().__init__(cfg, env)
++        self._command = torch.zeros(self.num_envs, 3, device=self.device)
++        self._beta = torch.zeros(self.num_envs, device=self.device)
++        self._fresh = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
++
++    @property
++    def command(self) -> torch.Tensor:
++        """``[0, 0, hop]``, shape ``(num_envs, 3)``."""
++        return self._command
++
++    @property
++    def beta(self) -> torch.Tensor:
++        """Blend from the still (0) to the hopping (1) rewards, shape ``(num_envs,)``."""
++        return self._beta
++
++    def set_command(self, command: torch.Tensor) -> None:
++        """Script all environments: write ``command`` ``(num_envs, 3)`` and stop the alternation."""
++        self._command[:] = command
++        self.time_left[:] = torch.inf
++
++    def reset(self, env_ids: Sequence[int] | slice | None = None) -> dict[str, torch.Tensor]:
++        ids = torch.arange(self.num_envs, device=self.device)[slice(None) if env_ids is None else env_ids]
++        self._fresh[ids] = True
++        self._beta[ids] = 0.0
++        return super().reset(env_ids)
++
++    def compute(self, dt: float):
++        super().compute(dt)
++        step = dt / max(self.cfg.ramp_s, 1e-6)
++        self._beta += torch.clamp(self._command[:, 2] - self._beta, -step, step)
++
++    def _resample_command(self, env_ids: Sequence[int] | slice):
++        ids = torch.arange(self.num_envs, device=self.device)[env_ids]
++        if len(ids) == 0:
++            return
++        hop = torch.where(self._fresh[ids], torch.zeros_like(self._beta[ids]), 1.0 - self._command[ids, 2])
++        self._command[ids, 2] = hop
++        still = torch.empty(len(ids), device=self.device).uniform_(*self.cfg.still_time_range)
++        hopping = torch.empty(len(ids), device=self.device).uniform_(*self.cfg.hop_time_range)
++        self.time_left[ids] = torch.where(hop > 0.5, hopping, still)
++        self._fresh[ids] = False
++
++    def _update_command(self):
++        pass
++
++    def _update_metrics(self):
++        pass
++
++
++@configclass
++class HopCommandCfg(CommandTermCfg):
++    """Configuration of :class:`HopCommand`; ``resampling_time_range`` is overridden by the phase ranges."""
++
++    class_type: type = HopCommand
++    still_time_range: tuple[float, float] = (1.5, 3.0)
++    """Duration [s] of a still phase."""
++    hop_time_range: tuple[float, float] = (2.0, 4.0)
++    """Duration [s] of a hopping phase."""
++    ramp_s: float = 0.3
++    """Time [s] for ``beta`` to cross from 0 to 1."""
++
++
++def _beta(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
++    return env.command_manager.get_term(command_name).beta
++
++
++def hop_air_time(
++    env: ManagerBasedRLEnv, command_name: str, sensor_cfg: SceneEntityCfg, min_air_time: float, max_air_time: float
++) -> torch.Tensor:
++    """Score in [0, 1] of the stance foot's flight ending this step while hopping: 0 at ``min_air_time`` [s] or
++    shorter, 1 at ``max_air_time`` [s] or longer. Only flights of the stance foot count, so a tapping swing foot earns
++    nothing."""
++    sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
++    landed = sensor.compute_first_contact(env.step_dt).torch[:, sensor_cfg.body_ids].any(dim=1).float()
++    air = zero_non_finite(sensor.data.last_air_time.torch[:, sensor_cfg.body_ids]).max(dim=1).values
++    score = torch.clamp((air - min_air_time) / (max_air_time - min_air_time), 0.0, 1.0)
++    return _beta(env, command_name) * landed * score
++
++
++def hop_ground_time_cost(
++    env: ManagerBasedRLEnv, command_name: str, sensor_cfg: SceneEntityCfg, max_contact_time: float
++) -> torch.Tensor:
++    """1 while hopping and the stance foot has stayed down longer than ``max_contact_time`` [s]."""
++    sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
++    contact_time = zero_non_finite(sensor.data.current_contact_time.torch[:, sensor_cfg.body_ids]).max(dim=1).values
++    return _beta(env, command_name) * (contact_time > max_contact_time).float()
++
++
++def hop_drift_cost(
++    env: ManagerBasedRLEnv,
++    command_name: str,
++    yaw_weight: float,
++    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
++) -> torch.Tensor:
++    """While hopping, squared horizontal trunk speed [m/s] plus ``yaw_weight`` times the squared yaw rate [rad/s]."""
++    asset: Articulation = env.scene[asset_cfg.name]
++    lin = zero_non_finite(asset.data.root_lin_vel_w.torch[:, :2])
++    yaw = zero_non_finite(asset.data.root_ang_vel_w.torch[:, 2])
++    return _beta(env, command_name) * ((lin**2).sum(dim=-1) + yaw_weight * yaw**2)
++
++
++def still_foot_in_contact(env: ManagerBasedRLEnv, command_name: str, sensor_cfg: SceneEntityCfg) -> torch.Tensor:
++    """:func:`foot_in_contact`, faded out while hopping."""
++    return (1.0 - _beta(env, command_name)) * foot_in_contact(env, sensor_cfg)
++
++
++def still_joint_vel_gaussian(
++    env: ManagerBasedRLEnv,
++    command_name: str,
++    std: float,
++    asset_cfg: SceneEntityCfg,
++    gate_sensor_cfg: SceneEntityCfg | None = None,
++) -> torch.Tensor:
++    """:func:`joint_vel_gaussian`, faded out while hopping."""
++    return (1.0 - _beta(env, command_name)) * joint_vel_gaussian(env, std, asset_cfg, gate_sensor_cfg)
+diff --git a/source/isaaclab_tasks/test/test_microduck_flamingo_hop.py b/source/isaaclab_tasks/test/test_microduck_flamingo_hop.py
+new file mode 100644
+index 000000000..66edcd0fd
+--- /dev/null
++++ b/source/isaaclab_tasks/test/test_microduck_flamingo_hop.py
+@@ -0,0 +1,188 @@
++# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
++# All rights reserved.
++#
++# SPDX-License-Identifier: BSD-3-Clause
++
++"""MicroDuck one-foot hopping on the right foot: the hop command, the hop rewards and the task contract."""
++
++from types import SimpleNamespace
++
++import gymnasium as gym
++import pytest
++import torch
++
++import isaaclab.sim as sim_utils
++from isaaclab.managers import SceneEntityCfg
++from isaaclab.sim import SimulationContext
++from isaaclab.test.utils import DeviceScope, test_devices
++
++import isaaclab_tasks  # noqa: F401
++from isaaclab_tasks.contrib.microduck import mdp
++from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
++
++HOP_TASK = "IsaacContrib-FlamingoHop-Flat-MicroDuck"
++
++
++def _command(num_envs=2):
++    cfg = mdp.HopCommandCfg(
++        resampling_time_range=(1.0, 1.0), still_time_range=(1.5, 1.5), hop_time_range=(2.0, 2.0), ramp_s=0.3
++    )
++    return mdp.HopCommand(cfg, SimpleNamespace(num_envs=num_envs, device="cpu"))
++
++
++def test_hop_command_starts_still_then_alternates_with_the_dwell_of_each_phase():
++    term = _command()
++    term.reset()
++    assert term.command.tolist() == [[0.0, 0.0, 0.0]] * 2
++    assert term.time_left.tolist() == pytest.approx([1.5, 1.5])
++    term._resample(slice(None))
++    assert term.command[:, 2].tolist() == [1.0, 1.0]
++    assert term.time_left.tolist() == pytest.approx([2.0, 2.0])
++    term._resample(slice(None))
++    assert term.command[:, 2].tolist() == [0.0, 0.0]
++
++
++def test_hop_blend_ramps_over_the_ramp_time_and_a_script_freezes_the_command():
++    term = _command(num_envs=1)
++    term.reset()
++    term.set_command(torch.tensor([[0.0, 0.0, 1.0]]))
++    for _ in range(9):  # 0.18 s of a 0.3 s ramp
++        term.compute(0.02)
++    assert term.beta.item() == pytest.approx(0.6, abs=1e-5)
++    for _ in range(200):
++        term.compute(0.02)
++    assert term.beta.item() == pytest.approx(1.0)
++    assert term.command[0, 2].item() == 1.0
++
++
++def _fake_env(beta, contact_time=None, first_contact=None, last_air_time=None, lin_vel=None, ang_vel=None):
++    n = len(beta)
++    term = SimpleNamespace(beta=torch.tensor(beta))
++    contact_time = torch.tensor(contact_time if contact_time is not None else [[0.1]] * n)
++    first = torch.tensor(first_contact if first_contact is not None else [[False]] * n)
++    air = torch.tensor(last_air_time if last_air_time is not None else [[0.0]] * n)
++    sensor = SimpleNamespace(
++        data=SimpleNamespace(
++            current_contact_time=SimpleNamespace(torch=contact_time), last_air_time=SimpleNamespace(torch=air)
++        ),
++        compute_first_contact=lambda dt: SimpleNamespace(torch=first),
++    )
++    data = {
++        "root_lin_vel_w": torch.tensor(lin_vel if lin_vel is not None else [[0.0, 0.0, 0.0]] * n),
++        "root_ang_vel_w": torch.tensor(ang_vel if ang_vel is not None else [[0.0, 0.0, 0.0]] * n),
++    }
++    robot = SimpleNamespace(data=SimpleNamespace(**{k: SimpleNamespace(torch=v) for k, v in data.items()}))
++
++    class Scene(dict):
++        sensors = {"contact_forces": sensor}
++
++    return SimpleNamespace(
++        scene=Scene(robot=robot),
++        command_manager=SimpleNamespace(get_term=lambda name: term),
++        step_dt=0.02,
++        num_envs=n,
++        device="cpu",
++    )
++
++
++_STANCE = SceneEntityCfg("contact_forces", body_ids=[0])
++
++
++def test_hop_air_time_pays_landings_of_real_flights_while_hopping():
++    # Landing after 80 ms while hopping, after 20 ms (too short), after 300 ms (capped), while still, and no landing.
++    env = _fake_env(
++        beta=[1.0, 1.0, 1.0, 0.0, 1.0],
++        first_contact=[[True], [True], [True], [True], [False]],
++        last_air_time=[[0.08], [0.02], [0.30], [0.08], [0.08]],
++    )
++    reward = mdp.hop_air_time(env, "base_velocity", _STANCE, min_air_time=0.04, max_air_time=0.12)
++    torch.testing.assert_close(reward, torch.tensor([0.5, 0.0, 1.0, 0.0, 0.0]))
++
++
++def test_hop_ground_time_cost_bites_only_long_stance_contacts_while_hopping():
++    env = _fake_env(beta=[1.0, 1.0, 0.0], contact_time=[[0.5], [0.2], [0.9]])
++    cost = mdp.hop_ground_time_cost(env, "base_velocity", _STANCE, max_contact_time=0.4)
++    torch.testing.assert_close(cost, torch.tensor([1.0, 0.0, 0.0]))
++
++
++def test_hop_drift_cost_penalizes_horizontal_and_yaw_motion_while_hopping():
++    env = _fake_env(
++        beta=[1.0, 0.0], lin_vel=[[0.3, 0.4, 1.0], [0.3, 0.4, 0.0]], ang_vel=[[0.0, 0.0, 2.0], [0.0, 0.0, 2.0]]
++    )
++    torch.testing.assert_close(mdp.hop_drift_cost(env, "base_velocity", yaw_weight=0.1), torch.tensor([0.65, 0.0]))
++
++
++def test_still_scaled_terms_fade_out_while_hopping():
++    env = _fake_env(beta=[0.0, 0.5, 1.0], contact_time=[[0.1], [0.1], [0.1]])
++    reward = mdp.still_foot_in_contact(env, "base_velocity", _STANCE)
++    torch.testing.assert_close(reward, torch.tensor([1.0, 0.5, 0.0]))
++
++
++"""
++Environment.
++"""
++
++
++@pytest.fixture(scope="module")
++def hop_env():
++    device = test_devices(DeviceScope.CUDA)[0]
++    cfg = parse_env_cfg(HOP_TASK, device=device, num_envs=32)
++    sim_utils.create_new_stage()
++    env = gym.make(HOP_TASK, cfg=cfg).unwrapped
++    env.reset()
++    yield env
++    env.close()
++    SimulationContext.clear_instance()
++
++
++@pytest.mark.integration
++@pytest.mark.kitless
++def test_hop_keeps_the_deployed_interface_and_the_flamingo_physics(hop_env):
++    env = hop_env
++    assert env.observation_manager.group_obs_dim["policy"] == (61,)
++    assert env.action_manager.total_action_dim == 14
++    assert isinstance(env.command_manager.get_term("base_velocity"), mdp.HopCommand)
++    assert env.cfg.sim.physics.solver_cfg.njmax == 1500
++    assert env.max_episode_length_s == pytest.approx(10.0)
++    # Pushes from the start at the stage-1 final magnitude, with no schedules.
++    assert env.cfg.events.push_robot.params["velocity_range"] == {"x": (-0.15, 0.15), "y": (-0.15, 0.15)}
++    assert all(term is None for term in env.cfg.curriculum.to_dict().values())
++
++
++@pytest.mark.integration
++@pytest.mark.kitless
++def test_hop_rewards(hop_env):
++    expected = {
++        "com_over_stance_foot": 3.0,
++        "stance_foot_grounded": 1.0,
++        "swing_foot_clear": 1.5,
++        "swing_foot_touch": -1.5,
++        "pose_flamingo": 1.5,
++        "gravity_flamingo": 2.0,
++        "stillness": 1.0,
++        "stance_side_tilt": -4.0,
++        "joint_limit_proximity": -1.0,
++        "action_rate_l2": -0.5,
++        "joint_torque_rate_l2": -1e-3,
++        "body_ang_vel": -0.05,
++        "angular_momentum": -0.02,
++        "self_collisions": -1.0,
++        "hop_air_time": 30.0,
++        "hop_ground_time": -2.0,
++        "hop_drift": -4.0,
++    }
++    manager = hop_env.reward_manager
++    weights = {name: manager.get_term_cfg(name).weight for name in manager.active_terms}
++    assert weights == pytest.approx(expected)
++    assert manager.get_term_cfg("com_over_stance_foot").params["std"] == 0.02
++
++
++@pytest.mark.integration
++@pytest.mark.kitless
++def test_hop_steps_with_finite_rewards(hop_env):
++    env = hop_env
++    env.reset()
++    actions = torch.zeros(env.num_envs, 14, device=env.device)
++    for _ in range(10):
++        _, reward, *_ = env.step(actions)
++        assert torch.isfinite(reward).all()
+-- 
+2.43.0
+

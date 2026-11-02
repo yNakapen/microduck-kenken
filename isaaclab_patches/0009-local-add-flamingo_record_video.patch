@@ -1,0 +1,275 @@
+From 03eac53abbd5ec3f6f38b8c7d22926802f038405 Mon Sep 17 00:00:00 2001
+From: Nakapen <nakapen@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 22:42:22 +0900
+Subject: [PATCH 09/19] #local add:flamingo_record_video
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+flamingo の推論の様子を MP4 に書き出す record_flamingo.py を追加。
+- 評価と同じ条件（set_eval_conditions を flamingo_metrics に切り出し、eval_flamingo.py と共有）
+- 環境ごとのカメラが胴体を追い、Newton の Warp レイトレーシングで描画（libGL 不要）
+- 各環境の 1 エピソード目を MP4 に流し込み、--keep（success / failure / all）に合う動画だけ残して容量を表示
+- MP4 の書き出しは imageio-ffmpeg 同梱の ffmpeg を uv run --with で使う
+
+初回学習の 900 it 時点・押し 0 で、成功したエピソード（片足支持 5.80 s、転倒なし）を
+640x480・50 fps・299 フレームで書き出し、容量は 230943 bytes（0.22 MiB）。
+---
+ .../microduck/eval_flamingo.py                |  13 +-
+ .../microduck/record_flamingo.py              | 147 ++++++++++++++++++
+ .../changelog.d/hop-local-hop-task.added.rst  |   3 +
+ .../contrib/microduck/flamingo_metrics.py     |  13 ++
+ .../test/test_microduck_flamingo_metrics.py   |  13 +-
+ 5 files changed, 181 insertions(+), 8 deletions(-)
+ create mode 100644 scripts/reinforcement_learning/microduck/record_flamingo.py
+
+diff --git a/scripts/reinforcement_learning/microduck/eval_flamingo.py b/scripts/reinforcement_learning/microduck/eval_flamingo.py
+index 711de951b..f652e05a4 100644
+--- a/scripts/reinforcement_learning/microduck/eval_flamingo.py
++++ b/scripts/reinforcement_learning/microduck/eval_flamingo.py
+@@ -32,7 +32,11 @@ from isaaclab.sim import SimulationContext
+ 
+ import isaaclab_tasks  # noqa: F401
+ from isaaclab_tasks.contrib.microduck import mdp
+-from isaaclab_tasks.contrib.microduck.flamingo_metrics import FLAMINGO_SUCCESS_HOLD, FlamingoEpisodeMetrics
++from isaaclab_tasks.contrib.microduck.flamingo_metrics import (
++    FLAMINGO_SUCCESS_HOLD,
++    FlamingoEpisodeMetrics,
++    set_eval_conditions,
++)
+ from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
+ 
+ TARGET_PUSH = 0.15
+@@ -62,12 +66,7 @@ def _parse_args() -> argparse.Namespace:
+ def _make_env(args: argparse.Namespace, push: float):
+     cfg = parse_env_cfg(args.task, device=args.device, num_envs=args.num_envs)
+     cfg.seed = args.seed
+-    # Freeze the schedules at their final stages, with the push under test.
+-    for name in list(cfg.curriculum.to_dict()):
+-        setattr(cfg.curriculum, name, None)
+-    cfg.events.push_robot.params["velocity_range"] = {"x": (-push, push), "y": (-push, push)}
+-    cfg.events.randomize_com.params["com_range"] = {axis: (-0.015, 0.015) for axis in "xyz"}
+-    cfg.events.randomize_head_com.params["com_range"] = {axis: (-0.01, 0.01) for axis in "xyz"}
++    set_eval_conditions(cfg, push)
+     sim_utils.create_new_stage()
+     return gym.make(args.task, cfg=cfg).unwrapped
+ 
+diff --git a/scripts/reinforcement_learning/microduck/record_flamingo.py b/scripts/reinforcement_learning/microduck/record_flamingo.py
+new file mode 100644
+index 000000000..a11248e00
+--- /dev/null
++++ b/scripts/reinforcement_learning/microduck/record_flamingo.py
+@@ -0,0 +1,147 @@
++# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
++# All rights reserved.
++#
++# SPDX-License-Identifier: BSD-3-Clause
++
++"""Record MP4 videos of an exported MicroDuck flamingo policy on Newton MJWarp under the evaluation conditions.
++
++A batch of environments runs one episode each, as in ``eval_flamingo.py``, while a camera per environment follows
++the trunk. Frames come from Newton's Warp ray-tracing renderer, so no OpenGL library is needed. Every environment's
++first episode is streamed to its own MP4; the episodes matching ``--keep`` are kept and the others deleted. The
++script prints each kept video's path, outcome and file size.
++
++Writing MP4 needs ffmpeg, which the ``imageio-ffmpeg`` wheel bundles:
++
++.. code-block:: bash
++
++    uv run --with imageio --with imageio-ffmpeg python scripts/reinforcement_learning/microduck/record_flamingo.py \\
++        --policy logs/rsl_rl/microduck_flamingo_flat/<run>/exported/policy.pt --push 0.0 --keep success
++"""
++
++from __future__ import annotations
++
++import argparse
++import os
++
++import gymnasium as gym
++import imageio.v2 as imageio
++import torch
++from isaaclab_newton.renderers import NewtonWarpRendererCfg
++
++import isaaclab.sim as sim_utils
++from isaaclab.managers import SceneEntityCfg
++from isaaclab.sensors import CameraCfg
++from isaaclab.sim import SimulationContext
++
++import isaaclab_tasks  # noqa: F401
++from isaaclab_tasks.contrib.microduck import mdp
++from isaaclab_tasks.contrib.microduck.flamingo_metrics import FlamingoEpisodeMetrics, set_eval_conditions
++from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
++
++CAMERA_OFFSET = (0.45, -0.45, 0.12)
++"""Camera eye relative to the trunk [m], in the world frame."""
++CAMERA_TARGET_OFFSET = (0.0, 0.0, -0.04)
++"""Look-at point relative to the trunk [m], in the world frame."""
++
++
++def _parse_args() -> argparse.Namespace:
++    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
++    parser.add_argument("--task", default="IsaacContrib-Flamingo-Flat-MicroDuck")
++    parser.add_argument("--policy", required=True, help="Exported TorchScript policy.pt.")
++    parser.add_argument("--push", type=float, default=0.0, help="Push magnitude [m/s].")
++    parser.add_argument("--num_envs", type=int, default=8, help="Episodes recorded in parallel.")
++    parser.add_argument("--keep", choices=("success", "failure", "all"), default="success")
++    parser.add_argument("--max_videos", type=int, default=1, help="Kept videos at most, in environment order.")
++    parser.add_argument("--seed", type=int, default=0)
++    parser.add_argument("--width", type=int, default=640)
++    parser.add_argument("--height", type=int, default=480)
++    parser.add_argument("--device", default="cuda:0")
++    parser.add_argument("--out_dir", default=None, help="Defaults to <policy dir>/videos_push<push>.")
++    return parser.parse_args()
++
++
++def _make_env(args: argparse.Namespace):
++    cfg = parse_env_cfg(args.task, device=args.device, num_envs=args.num_envs)
++    cfg.seed = args.seed
++    set_eval_conditions(cfg, args.push)
++    cfg.scene.record_camera = CameraCfg(
++        prim_path="{ENV_REGEX_NS}/RecordCamera",
++        update_period=0.0,
++        width=args.width,
++        height=args.height,
++        data_types=["rgb"],
++        spawn=sim_utils.PinholeCameraCfg(focal_length=18.0, clipping_range=(0.01, 20.0)),
++        renderer_cfg=NewtonWarpRendererCfg(),
++    )
++    sim_utils.create_new_stage()
++    return gym.make(args.task, cfg=cfg).unwrapped
++
++
++def _aim_cameras(env) -> None:
++    """Point every environment's camera at its trunk from a fixed world-frame offset."""
++    trunk = env.scene["robot"].data.root_link_pos_w.torch
++    offset = torch.tensor(CAMERA_OFFSET, device=trunk.device)
++    target = torch.tensor(CAMERA_TARGET_OFFSET, device=trunk.device)
++    env.scene["record_camera"].set_world_poses_from_view(trunk + offset, trunk + target)
++
++
++def main() -> None:
++    args = _parse_args()
++    policy = torch.jit.load(args.policy, map_location=args.device).eval()
++    out_dir = args.out_dir or os.path.join(os.path.dirname(os.path.abspath(args.policy)), f"videos_push{args.push:g}")
++    os.makedirs(out_dir, exist_ok=True)
++    env = _make_env(args)
++    try:
++        fps = round(1.0 / env.step_dt)
++        paths = [os.path.join(out_dir, f"seed{args.seed}_env{i:03d}.mp4") for i in range(env.num_envs)]
++        writers = [imageio.get_writer(p, fps=fps, codec="libx264", quality=7, macro_block_size=8) for p in paths]
++        stance_cfg = SceneEntityCfg("contact_forces", body_names=["ankle_right"])
++        swing_cfg = SceneEntityCfg("contact_forces", body_names=["ankle_left"])
++        stance_cfg.resolve(env.scene)
++        swing_cfg.resolve(env.scene)
++        robot, camera = env.scene["robot"], env.scene["record_camera"]
++        metrics = FlamingoEpisodeMetrics(env.num_envs, env.step_dt, device=env.device)
++        recording = torch.ones(env.num_envs, dtype=torch.bool)
++        obs, _ = env.reset()
++        with torch.inference_mode():
++            for _ in range(env.max_episode_length):
++                _aim_cameras(env)
++                obs, _, terminated, truncated, _ = env.step(policy(obs["policy"]))
++                done = (terminated | truncated).cpu()
++                metrics.update(
++                    stance_contact=mdp.foot_in_contact(env, stance_cfg).bool(),
++                    swing_contact=mdp.foot_in_contact(env, swing_cfg).bool(),
++                    done=terminated | truncated,
++                    time_out=truncated & ~terminated,
++                    gravity_b=robot.data.projected_gravity_b.torch,
++                )
++                # A terminal step's frame already shows the reset robot, so the episode ends one frame earlier.
++                recording &= ~done
++                frames = camera.data.output["rgb"].torch[..., :3].cpu().numpy()
++                for i in recording.nonzero().flatten().tolist():
++                    writers[i].append_data(frames[i])
++        for writer in writers:
++            writer.close()
++        summary = metrics.summary()
++    finally:
++        env.close()
++        SimulationContext.clear_instance()
++
++    wanted = {"success": summary["success"], "failure": ~summary["success"], "all": torch.ones_like(summary["success"])}
++    keep = wanted[args.keep].cpu().nonzero().flatten().tolist()[: args.max_videos]
++    for i, path in enumerate(paths):
++        if i not in keep:
++            os.remove(path)
++    if not keep:
++        print(f"[record_flamingo] no {args.keep} episode among {args.num_envs}; try more environments or seeds")
++    for i in keep:
++        size = os.path.getsize(paths[i])
++        print(
++            f"[record_flamingo] {paths[i]}: success={bool(summary['success'][i])}, fell={bool(summary['fell'][i])}, "
++            f"single support {float(summary['longest_single_support'][i]):.2f} s, "
++            f"duration {float(summary['duration'][i]):.2f} s, size {size} bytes ({size / 2**20:.2f} MiB)"
++        )
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/source/isaaclab_tasks/changelog.d/hop-local-hop-task.added.rst b/source/isaaclab_tasks/changelog.d/hop-local-hop-task.added.rst
+index f8e31267d..260ddf6d1 100644
+--- a/source/isaaclab_tasks/changelog.d/hop-local-hop-task.added.rst
++++ b/source/isaaclab_tasks/changelog.d/hop-local-hop-task.added.rst
+@@ -20,3 +20,6 @@
+   ``scripts/reinforcement_learning/microduck/eval_flamingo.py`` to evaluate exported MicroDuck flamingo policies on
+   Newton MJWarp with microduck_rl's stage-1 success metric (single support for 5 s without a fall) per push
+   magnitude, reporting fall sides and swing-foot touchdowns.
++* Added ``scripts/reinforcement_learning/microduck/record_flamingo.py`` to record MP4 videos of MicroDuck flamingo
++  episodes under the evaluation conditions with Newton's Warp ray-tracing camera, keeping successful or failed
++  episodes, and ``set_eval_conditions`` shared with the evaluation script.
+diff --git a/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_metrics.py b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_metrics.py
+index 9d323b935..7920ddbf2 100644
+--- a/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_metrics.py
++++ b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_metrics.py
+@@ -19,6 +19,19 @@ FLAMINGO_SUCCESS_HOLD = 5.0
+ """Single-support hold [s] microduck_rl's stage-1 success metric asks for."""
+ 
+ 
++def set_eval_conditions(cfg, push: float) -> None:
++    """Freeze a flamingo task config ``cfg`` at its final randomization with pushes of ``push`` [m/s].
++
++    The schedules are removed, so the CoM randomization takes its last curriculum range and the interval pushes
++    sample x and y velocities within ``push``.
++    """
++    for name in list(cfg.curriculum.to_dict()):
++        setattr(cfg.curriculum, name, None)
++    cfg.events.push_robot.params["velocity_range"] = {"x": (-push, push), "y": (-push, push)}
++    cfg.events.randomize_com.params["com_range"] = {axis: (-0.015, 0.015) for axis in "xyz"}
++    cfg.events.randomize_head_com.params["com_range"] = {axis: (-0.01, 0.01) for axis in "xyz"}
++
++
+ def fall_side(gravity_b: torch.Tensor, pose_gravity_b: torch.Tensor) -> list[str]:
+     """Label each trunk-frame gravity direction by its largest horizontal departure from the pose's.
+ 
+diff --git a/source/isaaclab_tasks/test/test_microduck_flamingo_metrics.py b/source/isaaclab_tasks/test/test_microduck_flamingo_metrics.py
+index 38e034991..7afbcc3d2 100644
+--- a/source/isaaclab_tasks/test/test_microduck_flamingo_metrics.py
++++ b/source/isaaclab_tasks/test/test_microduck_flamingo_metrics.py
+@@ -7,7 +7,9 @@
+ 
+ import torch
+ 
+-from isaaclab_tasks.contrib.microduck.flamingo_metrics import FlamingoEpisodeMetrics, fall_side
++import isaaclab_tasks  # noqa: F401
++from isaaclab_tasks.contrib.microduck.flamingo_metrics import FlamingoEpisodeMetrics, fall_side, set_eval_conditions
++from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
+ 
+ DT = 0.5
+ 
+@@ -64,3 +66,12 @@ def test_a_fall_fails_and_freezes_the_episode():
+ def test_fall_side_is_the_largest_departure_from_the_pose_lean():
+     gravity = torch.tensor([[0.0, -0.95, -0.3], [0.0, 0.5, -0.8], [0.9, -0.38, -0.2], [-0.9, -0.38, -0.2]])
+     assert fall_side(gravity, torch.tensor(_POSE_G)) == ["stance", "swing", "backward", "forward"]
++
++
++def test_eval_conditions_freeze_the_final_randomization_with_the_tested_push():
++    cfg = parse_env_cfg("IsaacContrib-Flamingo-Flat-MicroDuck", device="cpu", num_envs=1)
++    set_eval_conditions(cfg, 0.2)
++    assert all(term is None for term in cfg.curriculum.to_dict().values())
++    assert cfg.events.push_robot.params["velocity_range"] == {"x": (-0.2, 0.2), "y": (-0.2, 0.2)}
++    assert cfg.events.randomize_com.params["com_range"]["z"] == (-0.015, 0.015)
++    assert cfg.events.randomize_head_com.params["com_range"]["z"] == (-0.01, 0.01)
+-- 
+2.43.0
+

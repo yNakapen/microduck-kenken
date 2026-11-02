@@ -1,0 +1,181 @@
+From f3e19001069c8984b9ef63e59a53169136e50208 Mon Sep 17 00:00:00 2001
+From: Nakapen <nakapen@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 08:33:38 +0900
+Subject: [PATCH 18/19] #local add:hop_wait_cost
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+ケンケン区間で、立ち足が最後に離陸してから（またはケンケン区間の開始から）立っている時間を罰する hop_wait_cost（重み -2、上限なし）を追加し、離陸でリセットする。HopCommand に hop_time（ケンケン区間の経過時間）を追加。上限 2 s では立ち続けても 1 秒あたり +0.503 の正のままだったため上限なしにし、2.25 s 以降は立ち続けると 1 秒あたりの報酬が負になる。
+---
+ .../contrib/microduck/flamingo_hop_env_cfg.py |  6 +++
+ .../contrib/microduck/mdp/__init__.pyi        |  2 +
+ .../contrib/microduck/mdp/flamingo_hop.py     | 21 ++++++++++
+ .../test/test_microduck_flamingo_hop.py       | 38 ++++++++++++++++++-
+ 4 files changed, 65 insertions(+), 2 deletions(-)
+
+diff --git a/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_hop_env_cfg.py b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_hop_env_cfg.py
+index 92c867588..11587548f 100644
+--- a/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_hop_env_cfg.py
++++ b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_hop_env_cfg.py
+@@ -68,6 +68,12 @@ class FlamingoHopRewardsCfg(FlamingoRewardsCfg):
+         weight=-2.0,
+         params={"command_name": _COMMAND, "sensor_cfg": _STANCE_SENSOR_CFG, "max_contact_time": 0.4},
+     )
++    # Grows with the time spent standing on one foot before the next takeoff and resets when the foot leaves the floor.
++    hop_wait = RewTerm(
++        func=mdp.hop_wait_cost,
++        weight=-2.0,
++        params={"command_name": _COMMAND, "sensor_cfg": _STANCE_SENSOR_CFG},
++    )
+     hop_drift = RewTerm(func=mdp.hop_drift_cost, weight=-4.0, params={"command_name": _COMMAND, "yaw_weight": 0.1})
+ 
+     def __post_init__(self):
+diff --git a/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/mdp/__init__.pyi b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/mdp/__init__.pyi
+index a84c1deed..71614e2b1 100644
+--- a/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/mdp/__init__.pyi
++++ b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/mdp/__init__.pyi
+@@ -52,6 +52,7 @@ __all__ = [
+     "hop_air_time",
+     "hop_drift_cost",
+     "hop_ground_time_cost",
++    "hop_wait_cost",
+     "still_foot_in_contact",
+     "still_joint_vel_gaussian",
+     # observations
+@@ -132,6 +133,7 @@ from .flamingo_hop import (
+     hop_air_time,
+     hop_drift_cost,
+     hop_ground_time_cost,
++    hop_wait_cost,
+     still_foot_in_contact,
+     still_joint_vel_gaussian,
+ )
+diff --git a/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/mdp/flamingo_hop.py b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/mdp/flamingo_hop.py
+index ccf613bbc..1e6d54189 100644
+--- a/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/mdp/flamingo_hop.py
++++ b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/mdp/flamingo_hop.py
+@@ -43,6 +43,7 @@ class HopCommand(CommandTerm):
+         self._command = torch.zeros(self.num_envs, 3, device=self.device)
+         self._beta = torch.zeros(self.num_envs, device=self.device)
+         self._fresh = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
++        self._hop_time = torch.zeros(self.num_envs, device=self.device)
+ 
+     @property
+     def command(self) -> torch.Tensor:
+@@ -54,6 +55,11 @@ class HopCommand(CommandTerm):
+         """Blend from the still (0) to the hopping (1) rewards, shape ``(num_envs,)``."""
+         return self._beta
+ 
++    @property
++    def hop_time(self) -> torch.Tensor:
++        """Time [s] since hopping was commanded, 0 while still, shape ``(num_envs,)``."""
++        return self._hop_time
++
+     def set_command(self, command: torch.Tensor) -> None:
+         """Script all environments: write ``command`` ``(num_envs, 3)`` and stop the alternation."""
+         self._command[:] = command
+@@ -63,12 +69,15 @@ class HopCommand(CommandTerm):
+         ids = torch.arange(self.num_envs, device=self.device)[slice(None) if env_ids is None else env_ids]
+         self._fresh[ids] = True
+         self._beta[ids] = 0.0
++        self._hop_time[ids] = 0.0
+         return super().reset(env_ids)
+ 
+     def compute(self, dt: float):
+         super().compute(dt)
+         step = dt / max(self.cfg.ramp_s, 1e-6)
+         self._beta += torch.clamp(self._command[:, 2] - self._beta, -step, step)
++        hopping = self._command[:, 2] > 0.5
++        self._hop_time = torch.where(hopping, self._hop_time + dt, torch.zeros_like(self._hop_time))
+ 
+     def _resample_command(self, env_ids: Sequence[int] | slice):
+         ids = torch.arange(self.num_envs, device=self.device)[env_ids]
+@@ -141,6 +150,18 @@ def hop_ground_time_cost(
+     return _beta(env, command_name) * (contact_time > max_contact_time).float()
+ 
+ 
++def hop_wait_cost(env: ManagerBasedRLEnv, command_name: str, sensor_cfg: SceneEntityCfg) -> torch.Tensor:
++    """While hopping, the time [s] the stance foot has stood since its last takeoff or the start of hopping, whichever
++    is later: it grows the longer the robot waits on one foot and resets on a takeoff.
++
++    It is not capped, so standing through a hop phase eventually costs more than the still-stand rewards pay.
++    """
++    sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
++    contact_time = zero_non_finite(sensor.data.current_contact_time.torch[:, sensor_cfg.body_ids]).max(dim=1).values
++    term = env.command_manager.get_term(command_name)
++    return term.beta * torch.minimum(contact_time, term.hop_time)
++
++
+ def hop_drift_cost(
+     env: ManagerBasedRLEnv,
+     command_name: str,
+diff --git a/source/isaaclab_tasks/test/test_microduck_flamingo_hop.py b/source/isaaclab_tasks/test/test_microduck_flamingo_hop.py
+index b8cce55b2..39ddd2aca 100644
+--- a/source/isaaclab_tasks/test/test_microduck_flamingo_hop.py
++++ b/source/isaaclab_tasks/test/test_microduck_flamingo_hop.py
+@@ -55,11 +55,32 @@ def test_hop_blend_ramps_over_the_ramp_time_and_a_script_freezes_the_command():
+     assert term.command[0, 2].item() == 1.0
+ 
+ 
++def test_hop_time_counts_the_current_hop_phase_and_resets_when_still():
++    term = _command(num_envs=1)
++    term.reset()
++    term.set_command(torch.tensor([[0.0, 0.0, 1.0]]))
++    for _ in range(10):
++        term.compute(0.02)
++    assert term.hop_time.item() == pytest.approx(0.2)
++    term.set_command(torch.tensor([[0.0, 0.0, 0.0]]))
++    term.compute(0.02)
++    assert term.hop_time.item() == 0.0
++
++
+ def _fake_env(
+-    beta, contact_time=None, first_contact=None, last_air_time=None, lin_vel=None, ang_vel=None, current_air_time=None
++    beta,
++    contact_time=None,
++    first_contact=None,
++    last_air_time=None,
++    lin_vel=None,
++    ang_vel=None,
++    current_air_time=None,
++    hop_time=None,
+ ):
+     n = len(beta)
+-    term = SimpleNamespace(beta=torch.tensor(beta))
++    term = SimpleNamespace(
++        beta=torch.tensor(beta), hop_time=torch.tensor(hop_time if hop_time is not None else [9.0] * n)
++    )
+     contact_time = torch.tensor(contact_time if contact_time is not None else [[0.1]] * n)
+     first = torch.tensor(first_contact if first_contact is not None else [[False]] * n)
+     air = torch.tensor(last_air_time if last_air_time is not None else [[0.0]] * n)
+@@ -147,6 +168,18 @@ def test_hop_ground_time_cost_bites_only_long_stance_contacts_while_hopping():
+     torch.testing.assert_close(cost, torch.tensor([1.0, 0.0, 0.0]))
+ 
+ 
++def test_hop_wait_cost_grows_with_the_stance_time_since_the_last_takeoff_or_the_hop_start():
++    # Stance down 0.3 s and 1.2 s into a long hop phase; down 1.2 s but the hop phase started 0.5 s ago; 5 s without a
++    # takeoff keeps growing; just took off (contact time 0); still phase.
++    env = _fake_env(
++        beta=[1.0, 1.0, 1.0, 1.0, 1.0, 0.0],
++        contact_time=[[0.3], [1.2], [1.2], [5.0], [0.0], [1.2]],
++        hop_time=[3.0, 3.0, 0.5, 9.0, 3.0, 0.0],
++    )
++    cost = mdp.hop_wait_cost(env, "base_velocity", _STANCE)
++    torch.testing.assert_close(cost, torch.tensor([0.3, 1.2, 0.5, 5.0, 0.0, 0.0]))
++
++
+ def test_hop_drift_cost_penalizes_horizontal_and_yaw_motion_while_hopping():
+     env = _fake_env(
+         beta=[1.0, 0.0], lin_vel=[[0.3, 0.4, 1.0], [0.3, 0.4, 0.0]], ang_vel=[[0.0, 0.0, 2.0], [0.0, 0.0, 2.0]]
+@@ -211,6 +244,7 @@ def test_hop_rewards(hop_env):
+         "self_collisions": -1.0,
+         "hop_air_time": 30.0,
+         "hop_ground_time": -2.0,
++        "hop_wait": -2.0,
+         "hop_drift": -4.0,
+     }
+     manager = hop_env.reward_manager
+-- 
+2.43.0
+

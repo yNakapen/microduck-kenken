@@ -1,0 +1,464 @@
+From 2630b2d76251ec3eaf210338e788b89c7a0eb028 Mon Sep 17 00:00:00 2001
+From: Nakapen <nakapen@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 00:48:05 +0900
+Subject: [PATCH 14/19] #local add:flamingo_hop_eval
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+ケンケンの評価スクリプト eval_flamingo_hop.py と録画の --hop モードを追加。
+- 手順（右足）: 静止 2 s → hop=1 で 5 s まで → hop=0 で 8 s まで
+- 判定（承認済み）: 転倒 20% 以下、かつ転倒しなかった全エピソードで、立ち足の跳躍（20 ms 以上浮いて同じ足で着地、
+  2-5.3 s）5 回以上、上げた足の接地 0 回、5.5-8 s に片足支持 2 s 以上連続
+- HopEpisodeMetrics、hop_protocol_command、make_hop_env / run_hop_protocol を追加
+10 it の試験学習の方策で、評価と録画が最後まで動くことを確認した。
+---
+ .../microduck/eval_flamingo_hop.py            | 114 ++++++++++++++++++
+ .../microduck/record_flamingo.py              |  39 +++++-
+ .../changelog.d/hop-local-hop-task.added.rst  |   3 +
+ .../contrib/microduck/flamingo_eval.py        |  57 ++++++++-
+ .../contrib/microduck/flamingo_metrics.py     |  87 +++++++++++++
+ .../test/test_microduck_flamingo_metrics.py   |  35 ++++++
+ 6 files changed, 330 insertions(+), 5 deletions(-)
+ create mode 100644 scripts/reinforcement_learning/microduck/eval_flamingo_hop.py
+
+diff --git a/scripts/reinforcement_learning/microduck/eval_flamingo_hop.py b/scripts/reinforcement_learning/microduck/eval_flamingo_hop.py
+new file mode 100644
+index 000000000..2ef0d184c
+--- /dev/null
++++ b/scripts/reinforcement_learning/microduck/eval_flamingo_hop.py
+@@ -0,0 +1,114 @@
++# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
++# All rights reserved.
++#
++# SPDX-License-Identifier: BSD-3-Clause
++
++"""Evaluate an exported MicroDuck flamingo-hop policy on Newton MJWarp with a scripted still, hop, still protocol.
++
++Every environment spawns in the right-foot pose and is commanded ``[0, 0, 0]`` until 2 s, ``[0, 0, 1]`` (hop) until
++5 s and ``[0, 0, 0]`` until 8 s, under the training randomization with pushes of the given magnitude every 3 to 6 s.
++The test plan passes when at most 20 % of the episodes fall and every other episode makes at least 5 stance-foot hops,
++never touches down with the lifted foot, and then holds 2 s of uninterrupted single support. Results go to
++``episodes.csv`` and ``summary.md``.
++
++.. code-block:: bash
++
++    uv run python scripts/reinforcement_learning/microduck/eval_flamingo_hop.py \\
++        --policy logs/rsl_rl/microduck_flamingo_hop_flat/<run>/exported/policy.pt
++"""
++
++from __future__ import annotations
++
++import argparse
++import csv
++import os
++
++import torch
++
++from isaaclab.sim import SimulationContext
++
++import isaaclab_tasks  # noqa: F401
++from isaaclab_tasks.contrib.microduck.flamingo_eval import make_hop_env, run_hop_protocol
++from isaaclab_tasks.contrib.microduck.flamingo_metrics import (
++    HOP_MAX_FALL_FRACTION,
++    HOP_MIN_HOPS,
++    HOP_MIN_STILL,
++)
++
++NAMES = ("fell", "hops", "swing_touchdowns", "still_single_support", "success")
++
++
++def _parse_args() -> argparse.Namespace:
++    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
++    parser.add_argument("--task", default="IsaacContrib-FlamingoHop-Flat-MicroDuck")
++    parser.add_argument("--policy", required=True, help="Exported TorchScript policy.pt.")
++    parser.add_argument("--pushes", type=float, nargs="+", default=[0.0, 0.15], help="Push [m/s].")
++    parser.add_argument("--num_envs", type=int, default=512)
++    parser.add_argument("--seed", type=int, default=0)
++    parser.add_argument("--device", default="cuda:0")
++    parser.add_argument("--out_dir", default=None, help="Defaults to <policy dir>/eval_flamingo_hop.")
++    return parser.parse_args()
++
++
++def _passes(summary: dict) -> bool:
++    fell = summary["fell"]
++    return fell.float().mean().item() <= HOP_MAX_FALL_FRACTION and bool((fell | summary["success"]).all())
++
++
++def _write_results(args: argparse.Namespace, results: dict[float, dict]) -> str:
++    out_dir = args.out_dir or os.path.join(os.path.dirname(os.path.abspath(args.policy)), "eval_flamingo_hop")
++    os.makedirs(out_dir, exist_ok=True)
++    with open(os.path.join(out_dir, "episodes.csv"), "w", newline="") as file:
++        writer = csv.writer(file)
++        writer.writerow(["push", "env", *NAMES])
++        for push, summary in results.items():
++            for i in range(args.num_envs):
++                writer.writerow([push, i, *(float(summary[name][i]) for name in NAMES)])
++
++    lines = [
++        f"# {args.task}: flamingo hop evaluation",
++        "",
++        f"policy: `{args.policy}`, envs per push: {args.num_envs}, seed: {args.seed}. Protocol on the right foot: "
++        "still until 2 s, hop until 5 s, still until 8 s; randomization at its final stage; pushes every 3-6 s.",
++        "",
++        f"test plan: falls <= {HOP_MAX_FALL_FRACTION:.0%}, and every other episode makes >= {HOP_MIN_HOPS} stance-foot "
++        f"hops (flights >= 20 ms landing on the stance foot, 2-5.3 s), no lifted-foot touchdown, and >= "
++        f"{HOP_MIN_STILL:.0f} s of uninterrupted single support in 5.5-8 s.",
++        "",
++        "| push [m/s] | pass | success | falls | hops mean | hops min (not fallen) | episodes with swing touchdowns | "
++        "still single support [s] mean |",
++        "|---|---|---|---|---|---|---|---|",
++    ]
++    for push, s in results.items():
++        standing = ~s["fell"]
++        hops_min = int(s["hops"][standing].min()) if standing.any() else 0
++        lines.append(
++            f"| {push:.2f} | {'yes' if _passes(s) else 'no'} | {s['success'].float().mean():.1%} | "
++            f"{s['fell'].float().mean():.1%} | {s['hops'].float().mean():.2f} | {hops_min} | "
++            f"{(s['swing_touchdowns'] > 0).float().mean():.1%} | {s['still_single_support'].mean():.2f} |"
++        )
++    path = os.path.join(out_dir, "summary.md")
++    with open(path, "w") as file:
++        file.write("\n".join(lines) + "\n")
++    return path
++
++
++def main() -> None:
++    args = _parse_args()
++    policy = torch.jit.load(args.policy, map_location=args.device).eval()
++    results = {}
++    for push in args.pushes:
++        env = make_hop_env(args.task, args.device, args.num_envs, args.seed, push)
++        try:
++            results[push] = {k: v.cpu() for k, v in run_hop_protocol(env, policy).items()}
++        finally:
++            env.close()
++            SimulationContext.clear_instance()
++        print(f"[eval_flamingo_hop] push {push}: success {results[push]['success'].float().mean():.1%}")
++    path = _write_results(args, results)
++    with open(path) as file:
++        print(file.read())
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/scripts/reinforcement_learning/microduck/record_flamingo.py b/scripts/reinforcement_learning/microduck/record_flamingo.py
+index 2bc6fba59..cedb89d26 100644
+--- a/scripts/reinforcement_learning/microduck/record_flamingo.py
++++ b/scripts/reinforcement_learning/microduck/record_flamingo.py
+@@ -35,7 +35,12 @@ from isaaclab.sim import SimulationContext
+ 
+ import isaaclab_tasks  # noqa: F401
+ from isaaclab_tasks.contrib.microduck import mdp
+-from isaaclab_tasks.contrib.microduck.flamingo_eval import make_cycle_env, run_cycle_protocol
++from isaaclab_tasks.contrib.microduck.flamingo_eval import (
++    make_cycle_env,
++    make_hop_env,
++    run_cycle_protocol,
++    run_hop_protocol,
++)
+ from isaaclab_tasks.contrib.microduck.flamingo_metrics import FlamingoEpisodeMetrics, set_eval_conditions
+ from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
+ 
+@@ -56,6 +61,11 @@ def _parse_args() -> argparse.Namespace:
+         help="Run the flamingo-cycle protocol of eval_flamingo_cycle.py (stand, lift, hold, lower) instead of one "
+         "stage-1 episode; the first half of the environments stands on the right foot.",
+     )
++    parser.add_argument(
++        "--hop",
++        action="store_true",
++        help="Run the hop protocol of eval_flamingo_hop.py (still, hop, still) on the right foot.",
++    )
+     parser.add_argument("--num_envs", type=int, default=8, help="Episodes recorded in parallel.")
+     parser.add_argument("--keep", choices=("success", "failure", "all"), default="success")
+     parser.add_argument("--max_videos", type=int, default=1, help="Kept videos at most, in environment order.")
+@@ -151,17 +161,37 @@ def _record_cycle(args: argparse.Namespace, policy, writers) -> tuple[dict, str]
+     return summary, "side {side:+.0f}, hold single support {hold:.2f}, stand two feet {stand:.2f}"
+ 
+ 
++def _record_hop(args: argparse.Namespace, policy, writers) -> tuple[dict, str]:
++    env = make_hop_env(
++        args.task, args.device, args.num_envs, args.seed, args.push, scene_extras={"record_camera": _camera_cfg(args)}
++    )
++
++    def on_step(env, alive):
++        _write_frames(env, writers, alive)
++        _aim_cameras(env)
++
++    try:
++        _aim_cameras(env)
++        summary = run_hop_protocol(env, policy, on_step=on_step)
++    finally:
++        env.close()
++        SimulationContext.clear_instance()
++    return summary, "hops {hops:.0f}, swing touchdowns {touchdowns:.0f}, still single support {still:.2f} s"
++
++
+ def main() -> None:
+     args = _parse_args()
+     policy = torch.jit.load(args.policy, map_location=args.device).eval()
+-    default_dir = f"videos{'_cycle' if args.cycle else ''}_push{args.push:g}"
++    mode = "_cycle" if args.cycle else "_hop" if args.hop else ""
++    default_dir = f"videos{mode}_push{args.push:g}"
+     out_dir = args.out_dir or os.path.join(os.path.dirname(os.path.abspath(args.policy)), default_dir)
+     os.makedirs(out_dir, exist_ok=True)
+     paths = [os.path.join(out_dir, f"seed{args.seed}_env{i:03d}.mp4") for i in range(args.num_envs)]
+     # Every task steps at 50 Hz (dt 0.005 s, decimation 4).
+     writers = [imageio.get_writer(p, fps=50, codec="libx264", quality=7, macro_block_size=8) for p in paths]
+     try:
+-        summary, detail = (_record_cycle if args.cycle else _record_stage_one)(args, policy, writers)
++        record = _record_cycle if args.cycle else _record_hop if args.hop else _record_stage_one
++        summary, detail = record(args, policy, writers)
+     finally:
+         for writer in writers:
+             writer.close()
+@@ -182,6 +212,9 @@ def main() -> None:
+             "side": float(summary.get("side", torch.zeros(args.num_envs))[i]),
+             "hold": float(summary.get("hold_single_support", torch.zeros(args.num_envs))[i]),
+             "stand": float(summary.get("stand_two_feet", torch.zeros(args.num_envs))[i]),
++            "hops": float(summary.get("hops", torch.zeros(args.num_envs))[i]),
++            "touchdowns": float(summary.get("swing_touchdowns", torch.zeros(args.num_envs))[i]),
++            "still": float(summary.get("still_single_support", torch.zeros(args.num_envs))[i]),
+         }
+         print(
+             f"[record_flamingo] {paths[i]}: success={bool(success[i])}, fell={bool(summary['fell'][i])}, "
+diff --git a/source/isaaclab_tasks/changelog.d/hop-local-hop-task.added.rst b/source/isaaclab_tasks/changelog.d/hop-local-hop-task.added.rst
+index abe091851..bb01f5e93 100644
+--- a/source/isaaclab_tasks/changelog.d/hop-local-hop-task.added.rst
++++ b/source/isaaclab_tasks/changelog.d/hop-local-hop-task.added.rst
+@@ -35,3 +35,6 @@
+   holding still under pushes, fine-tuned from the flamingo stage-1 policy, with the ``HopCommand`` ``[0, 0, hop]``
+   twist-slot command and the ``hop_air_time``, ``hop_ground_time_cost``, ``hop_drift_cost``,
+   ``still_foot_in_contact`` and ``still_joint_vel_gaussian`` MicroDuck reward terms.
++* Added ``scripts/reinforcement_learning/microduck/eval_flamingo_hop.py`` with ``HopEpisodeMetrics`` and the
++  ``make_hop_env`` / ``run_hop_protocol`` rollout to evaluate MicroDuck flamingo-hop policies with a scripted still,
++  hop, still protocol against the hop test plan, and a ``--hop`` mode of ``record_flamingo.py``.
+diff --git a/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_eval.py b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_eval.py
+index 332aebf5c..ff4733626 100644
+--- a/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_eval.py
++++ b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_eval.py
+@@ -3,7 +3,7 @@
+ #
+ # SPDX-License-Identifier: BSD-3-Clause
+ 
+-"""Scripted rollouts of the MicroDuck flamingo cycle, shared by its evaluation and recording scripts."""
++"""Scripted rollouts of the MicroDuck flamingo cycle and hop tasks, shared by their evaluation and recording scripts."""
+ 
+ from __future__ import annotations
+ 
+@@ -18,7 +18,14 @@ from isaaclab.managers import SceneEntityCfg
+ from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
+ 
+ from . import mdp
+-from .flamingo_metrics import CycleEpisodeMetrics, cycle_protocol_command, set_eval_conditions
++from .flamingo_metrics import (
++    HOP_STILL_WINDOW,
++    CycleEpisodeMetrics,
++    HopEpisodeMetrics,
++    cycle_protocol_command,
++    hop_protocol_command,
++    set_eval_conditions,
++)
+ 
+ if TYPE_CHECKING:
+     from isaaclab.envs import ManagerBasedRLEnv
+@@ -77,3 +84,49 @@ def run_cycle_protocol(env, policy, on_step=None) -> dict:
+     summary = metrics.summary()
+     summary["side"] = side
+     return summary
++
++
++def make_hop_env(
++    task: str, device: str, num_envs: int, seed: int, push: float, scene_extras: dict | None = None
++) -> ManagerBasedRLEnv:
++    """Build the hop task under the evaluation conditions; every environment spawns in the one-foot pose."""
++    cfg = parse_env_cfg(task, device=device, num_envs=num_envs)
++    cfg.seed = seed
++    set_eval_conditions(cfg, push)
++    for name, value in (scene_extras or {}).items():
++        setattr(cfg.scene, name, value)
++    sim_utils.create_new_stage()
++    return gym.make(task, cfg=cfg).unwrapped
++
++
++def run_hop_protocol(env: ManagerBasedRLEnv, policy, on_step=None) -> dict:
++    """Roll the scripted still, hop, still protocol once on the right foot; ``on_step(env, alive)`` runs after each
++    step. Returns the hop summary."""
++    term = env.command_manager.get_term("base_velocity")
++    stance_cfg = SceneEntityCfg("contact_forces", body_names=["ankle_right"])
++    swing_cfg = SceneEntityCfg("contact_forces", body_names=["ankle_left"])
++    stance_cfg.resolve(env.scene)
++    swing_cfg.resolve(env.scene)
++    sensor = env.scene.sensors["contact_forces"]
++    metrics = HopEpisodeMetrics(env.num_envs, env.step_dt, device=env.device)
++    obs, _ = env.reset()
++    alive = torch.ones(env.num_envs, dtype=torch.bool, device=env.device)
++    steps = round(HOP_STILL_WINDOW[1] / env.step_dt)
++    with torch.inference_mode():
++        for step in range(steps):
++            term.set_command(hop_protocol_command(step * env.step_dt, env.num_envs, env.device))
++            obs, _, terminated, truncated, _ = env.step(policy(obs["policy"]))
++            stance = stance_cfg.body_ids[0]
++            metrics.update(
++                time=(step + 1) * env.step_dt,
++                stance_contact=mdp.foot_in_contact(env, stance_cfg).bool(),
++                stance_landing=sensor.compute_first_contact(env.step_dt).torch[:, stance].bool(),
++                stance_last_air_time=sensor.data.last_air_time.torch[:, stance],
++                swing_contact=mdp.foot_in_contact(env, swing_cfg).bool(),
++                done=terminated | truncated,
++                time_out=truncated & ~terminated,
++            )
++            alive &= ~(terminated | truncated)
++            if on_step is not None:
++                on_step(env, alive)
++    return metrics.summary()
+diff --git a/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_metrics.py b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_metrics.py
+index a317f364e..b130e84f1 100644
+--- a/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_metrics.py
++++ b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_metrics.py
+@@ -200,3 +200,90 @@ class CycleEpisodeMetrics:
+             & (self._hold_steps > 0)
+             & (self._stand_steps > 0),
+         }
++
++
++"""
++Flamingo hop.
++"""
++
++HOP_START_TIME = 2.0
++"""Protocol time [s] at which hopping is commanded, after a still one-foot stand."""
++HOP_STOP_TIME = 5.0
++"""Protocol time [s] at which a still one-foot stand is commanded again."""
++HOP_COUNT_WINDOW = (2.0, 5.3)
++"""Protocol window [s] whose stance-foot landings count as hops; it covers the 0.3 s blend back."""
++HOP_STILL_WINDOW = (5.5, 8.0)
++"""Protocol window [s] scored as the final still stand."""
++HOP_MIN_AIR_TIME = 0.02
++"""Shortest stance-foot flight [s] that counts as a hop, as in :mod:`~isaaclab_tasks.contrib.microduck.hop_metrics`."""
++HOP_MIN_HOPS = 5
++"""Hops a non-fallen episode must make."""
++HOP_MIN_STILL = 2.0
++"""Uninterrupted single support [s] a non-fallen episode must hold in the still window."""
++HOP_MAX_FALL_FRACTION = 0.2
++"""Largest fraction of episodes that may fall."""
++
++
++def hop_protocol_command(time: float, num_envs: int, device: str | torch.device = "cpu") -> torch.Tensor:
++    """Twist-slot command ``[0, 0, hop]`` of the hop protocol at ``time`` [s]: still, hopping, still."""
++    command = torch.zeros(num_envs, 3, device=device)
++    if HOP_START_TIME <= time < HOP_STOP_TIME:
++        command[:, 2] = 1.0
++    return command
++
++
++class HopEpisodeMetrics:
++    """Score one hop-protocol episode per environment; steps after a termination are ignored.
++
++    A hop is a landing of the stance foot after a flight of at least :data:`HOP_MIN_AIR_TIME` within
++    :data:`HOP_COUNT_WINDOW`; a swing touchdown is any new swing-foot contact. A non-fallen episode succeeds with at
++    least :data:`HOP_MIN_HOPS` hops, no swing touchdown and :data:`HOP_MIN_STILL` of uninterrupted single support in
++    :data:`HOP_STILL_WINDOW`.
++    """
++
++    def __init__(self, num_envs: int, step_dt: float, device: str = "cpu"):
++        self.step_dt = step_dt
++        self._active = torch.ones(num_envs, dtype=torch.bool, device=device)
++        self._fell = torch.zeros(num_envs, dtype=torch.bool, device=device)
++        self._hops = torch.zeros(num_envs, dtype=torch.long, device=device)
++        self._touchdowns = torch.zeros(num_envs, dtype=torch.long, device=device)
++        self._swing_was_down = torch.zeros(num_envs, dtype=torch.bool, device=device)
++        self._streak = torch.zeros(num_envs, device=device)
++        self._still = torch.zeros(num_envs, device=device)
++
++    def update(
++        self,
++        time: float,
++        stance_contact: torch.Tensor,
++        stance_landing: torch.Tensor,
++        stance_last_air_time: torch.Tensor,
++        swing_contact: torch.Tensor,
++        done: torch.Tensor,
++        time_out: torch.Tensor,
++    ) -> None:
++        """Record the step ending at protocol ``time`` [s]; ``stance_landing`` flags a stance-foot touchdown this step
++        and ``stance_last_air_time`` [s] its preceding flight."""
++        active = self._active
++        if HOP_COUNT_WINDOW[0] <= time <= HOP_COUNT_WINDOW[1]:
++            self._hops += (active & stance_landing & (stance_last_air_time >= HOP_MIN_AIR_TIME)).long()
++        self._touchdowns += (active & swing_contact & ~self._swing_was_down).long()
++        self._swing_was_down = swing_contact.clone()
++        if HOP_STILL_WINDOW[0] <= time <= HOP_STILL_WINDOW[1] + 1e-6:
++            single = active & stance_contact & ~swing_contact
++            self._streak = torch.where(single, self._streak + self.step_dt, torch.zeros_like(self._streak))
++            self._still = torch.maximum(self._still, self._streak)
++        self._fell |= active & done & ~time_out
++        self._active = active & ~done
++
++    def summary(self) -> dict[str, torch.Tensor]:
++        """Per-environment hops, swing touchdowns, final still support [s], falls and successes."""
++        return {
++            "fell": self._fell.clone(),
++            "hops": self._hops.clone(),
++            "swing_touchdowns": self._touchdowns.clone(),
++            "still_single_support": self._still.clone(),
++            "success": ~self._fell
++            & (self._hops >= HOP_MIN_HOPS)
++            & (self._touchdowns == 0)
++            & (self._still >= HOP_MIN_STILL - 1e-6),
++        }
+diff --git a/source/isaaclab_tasks/test/test_microduck_flamingo_metrics.py b/source/isaaclab_tasks/test/test_microduck_flamingo_metrics.py
+index 94570597c..9b0631a84 100644
+--- a/source/isaaclab_tasks/test/test_microduck_flamingo_metrics.py
++++ b/source/isaaclab_tasks/test/test_microduck_flamingo_metrics.py
+@@ -11,8 +11,10 @@ import isaaclab_tasks  # noqa: F401
+ from isaaclab_tasks.contrib.microduck.flamingo_metrics import (
+     CycleEpisodeMetrics,
+     FlamingoEpisodeMetrics,
++    HopEpisodeMetrics,
+     cycle_protocol_command,
+     fall_side,
++    hop_protocol_command,
+     set_eval_conditions,
+ )
+ from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
+@@ -108,3 +110,36 @@ def test_cycle_metrics_score_the_hold_and_the_final_stand_windows():
+     torch.testing.assert_close(summary["hold_single_support"], torch.tensor([1.0, 0.75]))
+     torch.testing.assert_close(summary["stand_two_feet"], torch.tensor([1.0, 1.0]))
+     torch.testing.assert_close(summary["success"], torch.tensor([True, False]))
++
++
++def test_hop_protocol_stills_hops_and_stills_again():
++    assert hop_protocol_command(1.0, 2).tolist() == [[0.0, 0.0, 0.0]] * 2
++    assert hop_protocol_command(3.0, 2).tolist() == [[0.0, 0.0, 1.0]] * 2
++    assert hop_protocol_command(6.0, 2).tolist() == [[0.0, 0.0, 0.0]] * 2
++
++
++def test_hop_metrics_count_stance_hops_swing_touchdowns_and_the_final_still_stand():
++    # 0.1 s steps over 8 s. env 0: lands 6 times during the hop window, then stands still on one foot.
++    # env 1: lands twice and touches the floor with its swing foot once.
++    dt = 0.1
++    metrics = HopEpisodeMetrics(num_envs=2, step_dt=dt)
++    for k in range(80):
++        t = round((k + 1) * dt, 6)
++        hopping = 2.2 <= t <= 5.2
++        landing0 = hopping and round(t * 10) % 5 == 0
++        landing1 = hopping and t in (3.0, 4.0)
++        metrics.update(
++            time=t,
++            stance_contact=torch.tensor([not hopping or landing0, not hopping or landing1]),
++            stance_landing=torch.tensor([landing0, landing1]),
++            stance_last_air_time=torch.tensor([0.4, 0.9]),
++            swing_contact=torch.tensor([False, t == 4.5]),
++            done=torch.tensor([False, False]),
++            time_out=torch.tensor([False, False]),
++        )
++    summary = metrics.summary()
++    assert summary["hops"].tolist() == [6, 2]
++    assert summary["swing_touchdowns"].tolist() == [0, 1]
++    # Still window 5.5-8.0 s: 26 steps of 0.1 s.
++    torch.testing.assert_close(summary["still_single_support"], torch.tensor([2.6, 2.6]))
++    assert summary["success"].tolist() == [True, False]
+-- 
+2.43.0
+

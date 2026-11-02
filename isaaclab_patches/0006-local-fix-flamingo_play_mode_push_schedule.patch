@@ -1,0 +1,55 @@
+From 6ec0853ec9382348b94fbef79258b6c3135995e3 Mon Sep 17 00:00:00 2001
+From: Nakapen <nakapen@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 22:11:19 +0900
+Subject: [PATCH 06/19] #local fix:flamingo_play_mode_push_schedule
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+play モードで push_robot が無効になるのに、押しの強さのカリキュラムが残っていて、最初のリセットで AttributeError になっていた。play_mode で push_magnitude も外す。カリキュラムの参照先が有効なイベントかを確かめるテストを追加。
+---
+ .../contrib/microduck/flamingo_env_cfg.py          |  5 +++++
+ .../test/test_microduck_flamingo_env.py            | 14 ++++++++++++++
+ 2 files changed, 19 insertions(+)
+
+diff --git a/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_env_cfg.py b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_env_cfg.py
+index 229fdaa1b..e28d9c395 100644
+--- a/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_env_cfg.py
++++ b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_env_cfg.py
+@@ -198,3 +198,8 @@ class MicroDuckFlamingoFlatEnvCfg(MicroDuckVelocityFlatEnvCfg):
+         # microduck_rl runs MuJoCo Warp's own collision detection instead of Newton's pipeline.
+         self.sim.physics.solver_cfg.use_mujoco_contacts = True
+         self.sim.physics.collision_cfg = None
++
++    def play_mode(self):
++        """Disable interval pushes together with their magnitude schedule."""
++        super().play_mode()
++        self.curriculum.push_magnitude = None
+diff --git a/source/isaaclab_tasks/test/test_microduck_flamingo_env.py b/source/isaaclab_tasks/test/test_microduck_flamingo_env.py
+index 34f631a4d..e71c227fe 100644
+--- a/source/isaaclab_tasks/test/test_microduck_flamingo_env.py
++++ b/source/isaaclab_tasks/test/test_microduck_flamingo_env.py
+@@ -108,6 +108,20 @@ def test_reset_orientation_matches_microduck_rl_zyx_euler():
+     torch.testing.assert_close(quat_from_euler_xyz(roll, pitch, yaw), wxyz[:, [1, 2, 3, 0]])
+ 
+ 
++@pytest.mark.parametrize("play", [False, True])
++def test_every_event_schedule_targets_an_enabled_event(play):
++    """Play mode drops the pushes; a schedule still pointing at them fails on the first reset."""
++    cfg = parse_env_cfg(FLAMINGO_TASK, device="cpu", num_envs=1)
++    if play:
++        cfg.play_mode()
++    for name, term in cfg.curriculum.to_dict().items():
++        if term is None:
++            continue
++        address = term["params"]["address"].split(".")
++        if address[0] == "events":
++            assert getattr(cfg.events, address[1]) is not None, f"curriculum {name} targets disabled {address[1]}"
++
++
+ """
+ Environment.
+ """
+-- 
+2.43.0
+

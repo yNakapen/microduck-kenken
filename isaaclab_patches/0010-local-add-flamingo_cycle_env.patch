@@ -1,0 +1,1010 @@
+From 8c1b1d08ba9466c92ee3408dae70f5afef1cfebc Mon Sep 17 00:00:00 2001
+From: Nakapen <nakapen@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 23:47:12 +0900
+Subject: [PATCH 10/19] #local add:flamingo_cycle_env
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+microduck_rl の Cycle 版（Mjlab-FlamingoCycle-Flat-MicroDuck、flamingo ブランチ 4757d6ae）を
+IsaacContrib-FlamingoCycle-Flat-MicroDuck として移植。
+- 指令 FlamingoCommand: twist 枠 [flag, side, 0]、2.5-5 s で選び直し（片足 0.6）、α を 1.5 s で変化、
+  立つ足のラッチ、両足のとき side を 0.5 の確率で 0、出現イベントが立つ足を指定
+- 出現 reset_flamingo_cycle_pose: 左右どちらかの片足姿勢（0.6→0.4→0.3）か HOME の両足立ち、α を初期化
+- 報酬: α で切り替わる cycle_* 9 項（非正の項は cost 規約で負の重み）と段階 1 の正則化
+- カリキュラム: 押し 0.08（500 it）→0.15（1000 it）、action_rate -0.5（600 it）、torque_rate（800 it）、
+  重心 std 0.02（700 it）
+- エピソード 10 s、PPO は段階 1 と同じで 3000 it
+---
+ .../changelog.d/hop-local-hop-task.added.rst  |   4 +
+ .../contrib/microduck/__init__.py             |  10 +
+ .../microduck/agents/rsl_rl_ppo_cfg.py        |   7 +
+ .../microduck/flamingo_cycle_env_cfg.py       | 196 +++++++++
+ .../contrib/microduck/mdp/__init__.pyi        |  27 ++
+ .../contrib/microduck/mdp/flamingo_cycle.py   | 371 ++++++++++++++++++
+ .../test/test_microduck_flamingo_cycle.py     | 296 ++++++++++++++
+ 7 files changed, 911 insertions(+)
+ create mode 100644 source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_cycle_env_cfg.py
+ create mode 100644 source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/mdp/flamingo_cycle.py
+ create mode 100644 source/isaaclab_tasks/test/test_microduck_flamingo_cycle.py
+
+diff --git a/source/isaaclab_tasks/changelog.d/hop-local-hop-task.added.rst b/source/isaaclab_tasks/changelog.d/hop-local-hop-task.added.rst
+index 260ddf6d1..8cf073917 100644
+--- a/source/isaaclab_tasks/changelog.d/hop-local-hop-task.added.rst
++++ b/source/isaaclab_tasks/changelog.d/hop-local-hop-task.added.rst
+@@ -23,3 +23,7 @@
+ * Added ``scripts/reinforcement_learning/microduck/record_flamingo.py`` to record MP4 videos of MicroDuck flamingo
+   episodes under the evaluation conditions with Newton's Warp ray-tracing camera, keeping successful or failed
+   episodes, and ``set_eval_conditions`` shared with the evaluation script.
++* Added ``IsaacContrib-FlamingoCycle-Flat-MicroDuck``, a port of microduck_rl's controller-driven flamingo cycle
++  (``Mjlab-FlamingoCycle-Flat-MicroDuck``) that stands, lifts either foot on command, holds and lowers with one
++  policy, with the ``FlamingoCommand`` twist-slot command, the ``reset_flamingo_cycle_pose`` event and the
++  ``cycle_*`` blended MicroDuck reward terms.
+diff --git a/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/__init__.py b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/__init__.py
+index 92b6831d3..bcebcc9d0 100644
+--- a/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/__init__.py
++++ b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/__init__.py
+@@ -40,6 +40,16 @@ gym.register(
+     },
+ )
+ 
++gym.register(
++    id="IsaacContrib-FlamingoCycle-Flat-MicroDuck",
++    entry_point="isaaclab.envs:ManagerBasedRLEnv",
++    disable_env_checker=True,
++    kwargs={
++        "env_cfg_entry_point": f"{__name__}.flamingo_cycle_env_cfg:MicroDuckFlamingoCycleFlatEnvCfg",
++        "rsl_rl_cfg_entry_point": f"{__name__}.agents.rsl_rl_ppo_cfg:MicroDuckFlamingoCyclePPORunnerCfg",
++    },
++)
++
+ gym.register(
+     id="IsaacContrib-Velocity-Rough-MicroDuck",
+     entry_point="isaaclab.envs:ManagerBasedRLEnv",
+diff --git a/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/agents/rsl_rl_ppo_cfg.py b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/agents/rsl_rl_ppo_cfg.py
+index 0c4138837..300a6832d 100644
+--- a/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/agents/rsl_rl_ppo_cfg.py
++++ b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/agents/rsl_rl_ppo_cfg.py
+@@ -64,6 +64,13 @@ class MicroDuckFlamingoPPORunnerCfg(MicroDuckPPORunnerCfg):
+     experiment_name = "microduck_flamingo_flat"
+ 
+ 
++@configclass
++class MicroDuckFlamingoCyclePPORunnerCfg(MicroDuckFlamingoPPORunnerCfg):
++    """The flamingo recipe in its own experiment directory, as microduck_rl's cycle copies it."""
++
++    experiment_name = "microduck_flamingo_cycle_flat"
++
++
+ @configclass
+ class MicroDuckRoughPPORunnerCfg(MicroDuckPPORunnerCfg):
+     """The same PPO recipe with a separate experiment directory for rough terrain."""
+diff --git a/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_cycle_env_cfg.py b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_cycle_env_cfg.py
+new file mode 100644
+index 000000000..44532b132
+--- /dev/null
++++ b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/flamingo_cycle_env_cfg.py
+@@ -0,0 +1,196 @@
++# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
++# All rights reserved.
++#
++# SPDX-License-Identifier: BSD-3-Clause
++
++"""Flamingo cycle: stand, lift either foot on command, hold, lower, with one policy; microduck_rl's stage 2.
++
++A port of ``Mjlab-FlamingoCycle-Flat-MicroDuck`` (``src/mjlab_microduck/tasks/microduck_flamingo_cycle_env_cfg.py``
++on the microduck_rl ``flamingo`` branch, ``4757d6ae``). The twist slots carry ``[flag, side, 0]`` from
++:class:`~isaaclab_tasks.contrib.microduck.mdp.FlamingoCommand`; the rewards follow its slewed blend ``alpha`` from
++the two-foot to the one-foot targets. Everything else is the flamingo stage-1 task's.
++"""
++
++import math
++
++from isaaclab.managers import EventTermCfg as EventTerm
++from isaaclab.managers import RewardTermCfg as RewTerm
++from isaaclab.managers import SceneEntityCfg
++from isaaclab.utils.configclass import configclass
++
++from isaaclab_assets.robots.microduck import MICRODUCK_JOINT_NAMES
++
++from . import mdp
++from .flamingo_env_cfg import (
++    FLAMINGO_MAX_PUSH,
++    FLAMINGO_STANCE_SIDE_TILT,
++    FLAMINGO_SWING_FOOT_STD,
++    FLAMINGO_SWING_FOOT_TARGET_Z,
++    FlamingoCommandsCfg,
++    FlamingoCurriculumCfg,
++    FlamingoEventsCfg,
++    MicroDuckFlamingoFlatEnvCfg,
++)
++from .flamingo_pose import (
++    FLAMINGO_BASE_PITCH,
++    FLAMINGO_BASE_ROLL,
++    FLAMINGO_GRAVITY_B,
++    FLAMINGO_POSE_LEFT,
++    FLAMINGO_POSE_RIGHT,
++    FLAMINGO_Z,
++)
++from .flat_env_cfg import _schedule
++
++_SERVO_JOINT_CFG = SceneEntityCfg("robot", joint_names=MICRODUCK_JOINT_NAMES, preserve_order=True)
++_TRUNK_BODY_CFG = SceneEntityCfg("robot", body_names=["trunk_base"])
++_FEET_CFG = SceneEntityCfg("robot", body_names=["ankle_left", "ankle_right"], preserve_order=True)
++_FEET_SENSOR_CFG = SceneEntityCfg("contact_forces", body_names=["ankle_left", "ankle_right"], preserve_order=True)
++_COMMAND = "base_velocity"
++
++FLAMINGO_CYCLE_DWELL_S = (2.5, 5.0)
++"""Time [s] in each commanded posture before the flag may flip; longer than the 1.5 s ramp."""
++
++
++@configclass
++class FlamingoCycleCommandsCfg(FlamingoCommandsCfg):
++    """``[flag, side, 0]`` in the twist slots; the head and body commands of the stage-1 task."""
++
++    base_velocity = mdp.FlamingoCommandCfg(
++        resampling_time_range=FLAMINGO_CYCLE_DWELL_S, flamingo_prob=0.6, ramp_s=1.5, zero_side_prob=0.5
++    )
++
++
++@configclass
++class FlamingoCycleRewardsCfg:
++    """microduck_rl's cycle rewards; its non-positive terms are costs with negative weights here."""
++
++    # The weight shift leads: the CoM target slides from the feet midpoint to the stance foot.
++    com_target = RewTerm(
++        func=mdp.cycle_com_target, weight=3.0, params={"command_name": _COMMAND, "feet_cfg": _FEET_CFG, "std": 0.03}
++    )
++    stance_foot_grounded = RewTerm(
++        func=mdp.cycle_stance_foot_grounded,
++        weight=1.0,
++        params={"command_name": _COMMAND, "feet_sensor_cfg": _FEET_SENSOR_CFG},
++    )
++    # +1 while standing is due, -1 once the lift is due: mixed sign by design.
++    swing_foot_contact = RewTerm(
++        func=mdp.cycle_swing_foot_contact,
++        weight=0.5,
++        params={"command_name": _COMMAND, "feet_sensor_cfg": _FEET_SENSOR_CFG, "lo": 0.4, "hi": 0.9},
++    )
++    swing_foot_clear = RewTerm(
++        func=mdp.cycle_swing_foot_clear,
++        weight=1.5,
++        params={
++            "command_name": _COMMAND,
++            "feet_cfg": _FEET_CFG,
++            "feet_sensor_cfg": _FEET_SENSOR_CFG,
++            "target": FLAMINGO_SWING_FOOT_TARGET_Z,
++            "std": FLAMINGO_SWING_FOOT_STD,
++            "lo": 0.6,
++            "hi": 1.0,
++        },
++    )
++    pose_track = RewTerm(
++        func=mdp.cycle_pose_track,
++        weight=1.5,
++        params={
++            "command_name": _COMMAND,
++            "pose_right": FLAMINGO_POSE_RIGHT,
++            "pose_left": FLAMINGO_POSE_LEFT,
++            "std": 0.5,
++            "mid_attenuation": 0.75,
++            "asset_cfg": _SERVO_JOINT_CFG,
++        },
++    )
++    gravity_track = RewTerm(
++        func=mdp.cycle_gravity_track,
++        weight=2.0,
++        params={"command_name": _COMMAND, "gravity_right": FLAMINGO_GRAVITY_B, "std": 0.15},
++    )
++    stillness = RewTerm(
++        func=mdp.cycle_stillness,
++        weight=1.0,
++        params={
++            "command_name": _COMMAND,
++            "feet_sensor_cfg": _FEET_SENSOR_CFG,
++            "std": 2.0,
++            "asset_cfg": _SERVO_JOINT_CFG,
++        },
++    )
++    stance_side_tilt = RewTerm(
++        func=mdp.cycle_stance_side_tilt_cost,
++        weight=-4.0,
++        params={"command_name": _COMMAND, "threshold": FLAMINGO_STANCE_SIDE_TILT},
++    )
++    # Logged success indicator; a zero weight would skip the term entirely.
++    commanded_support = RewTerm(
++        func=mdp.cycle_single_support_success,
++        weight=1e-3,
++        params={"command_name": _COMMAND, "feet_sensor_cfg": _FEET_SENSOR_CFG},
++    )
++    joint_limit_proximity = RewTerm(
++        func=mdp.joint_limit_proximity, weight=-1.0, params={"margin": 0.1, "asset_cfg": _SERVO_JOINT_CFG}
++    )
++    action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-0.1)
++    joint_torque_rate_l2 = RewTerm(func=mdp.joint_torque_rate_l2, weight=0.0, params={"asset_cfg": _SERVO_JOINT_CFG})
++    body_ang_vel = RewTerm(func=mdp.body_ang_vel_xy_l2, weight=-0.05, params={"asset_cfg": _TRUNK_BODY_CFG})
++    angular_momentum = RewTerm(func=mdp.angular_momentum_l2, weight=-0.02)
++    self_collisions = RewTerm(
++        func=mdp.self_collision_cost, weight=-1.0, params={"sensor_cfg": SceneEntityCfg("self_collision")}
++    )
++
++
++@configclass
++class FlamingoCycleEventsCfg(FlamingoEventsCfg):
++    """Spawn in either side's one-foot pose or standing at HOME, with the side pinned into the command."""
++
++    reset_flamingo_pose = None
++    reset_flamingo_cycle_pose = EventTerm(
++        func=mdp.reset_flamingo_cycle_pose,
++        mode="reset",
++        params={
++            "pose_right": FLAMINGO_POSE_RIGHT,
++            "pose_left": FLAMINGO_POSE_LEFT,
++            "base_roll": FLAMINGO_BASE_ROLL,
++            "base_pitch": FLAMINGO_BASE_PITCH,
++            "z_range": (FLAMINGO_Z, FLAMINGO_Z + 0.01),
++            "standing_z_range": (0.11, 0.12),
++            "command_name": _COMMAND,
++            "in_pose_prob": 0.6,
++            "xy_range": 0.5,
++            "tilt_noise": math.radians(3.0),
++            "joint_noise_std": 0.05,
++            "asset_cfg": _SERVO_JOINT_CFG,
++        },
++    )
++
++
++@configclass
++class FlamingoCycleCurriculumCfg(FlamingoCurriculumCfg):
++    """microduck_rl's cycle schedules: transitions are harder than the hold, so the ramps come later."""
++
++    push_magnitude = _schedule(
++        "events.push_robot.params.velocity_range",
++        (500, {"x": (-0.08, 0.08), "y": (-0.08, 0.08)}),
++        (1000, {"x": (-FLAMINGO_MAX_PUSH, FLAMINGO_MAX_PUSH), "y": (-FLAMINGO_MAX_PUSH, FLAMINGO_MAX_PUSH)}),
++    )
++    action_rate_weight = _schedule("rewards.action_rate_l2.weight", (600, -0.5))
++    torque_rate_weight = _schedule("rewards.joint_torque_rate_l2.weight", (800, -1e-3))
++    com_std = _schedule("rewards.com_target.params.std", (700, 0.02))
++    in_pose_prob = _schedule("events.reset_flamingo_cycle_pose.params.in_pose_prob", (600, 0.4), (1200, 0.3))
++
++
++@configclass
++class MicroDuckFlamingoCycleFlatEnvCfg(MicroDuckFlamingoFlatEnvCfg):
++    """MicroDuck stand and one-foot cycle on either foot with Newton MJWarp and BAM servos."""
++
++    commands: FlamingoCycleCommandsCfg = FlamingoCycleCommandsCfg()
++    rewards: FlamingoCycleRewardsCfg = FlamingoCycleRewardsCfg()
++    events: FlamingoCycleEventsCfg = FlamingoCycleEventsCfg()
++    curriculum: FlamingoCycleCurriculumCfg = FlamingoCycleCurriculumCfg()
++
++    def __post_init__(self):
++        super().__post_init__()
++        self.episode_length_s = 10.0
+diff --git a/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/mdp/__init__.pyi b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/mdp/__init__.pyi
+index cfd6c9282..321d2caea 100644
+--- a/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/mdp/__init__.pyi
++++ b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/mdp/__init__.pyi
+@@ -33,6 +33,19 @@ __all__ = [
+     "projected_gravity_match",
+     "reset_flamingo_pose",
+     "robot_com_pos_w",
++    # flamingo cycle
++    "FlamingoCommand",
++    "FlamingoCommandCfg",
++    "cycle_com_target",
++    "cycle_gravity_track",
++    "cycle_pose_track",
++    "cycle_single_support_success",
++    "cycle_stance_foot_grounded",
++    "cycle_stance_side_tilt_cost",
++    "cycle_stillness",
++    "cycle_swing_foot_clear",
++    "cycle_swing_foot_contact",
++    "reset_flamingo_cycle_pose",
+     # observations
+     "ImuNoiseCfg",
+     "foot_air_time_safe",
+@@ -91,6 +104,20 @@ from .flamingo import (
+     reset_flamingo_pose,
+     robot_com_pos_w,
+ )
++from .flamingo_cycle import (
++    FlamingoCommand,
++    FlamingoCommandCfg,
++    cycle_com_target,
++    cycle_gravity_track,
++    cycle_pose_track,
++    cycle_single_support_success,
++    cycle_stance_foot_grounded,
++    cycle_stance_side_tilt_cost,
++    cycle_stillness,
++    cycle_swing_foot_clear,
++    cycle_swing_foot_contact,
++    reset_flamingo_cycle_pose,
++)
+ from .observations import (
+     ImuNoiseCfg,
+     foot_air_time_safe,
+diff --git a/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/mdp/flamingo_cycle.py b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/mdp/flamingo_cycle.py
+new file mode 100644
+index 000000000..1551c5696
+--- /dev/null
++++ b/source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/mdp/flamingo_cycle.py
+@@ -0,0 +1,371 @@
++# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
++# All rights reserved.
++#
++# SPDX-License-Identifier: BSD-3-Clause
++
++"""Command, reset and rewards of the flamingo cycle: stand, lift one foot, hold, lower, on either side.
++
++Ports ``FlamingoCommand``, ``set_flamingo_cycle_state`` and the ``fl_*`` rewards of microduck_rl
++(``src/mjlab_microduck/tasks/mdp.py`` on the ``flamingo`` branch, ``4757d6ae``). The command occupies the twist slots
++as ``[flag, side, 0]``: ``flag`` 1 asks for one foot, 0 for two; ``side`` +1 stands on the right foot, -1 on the
++left. An internal blend ``alpha`` slews toward the flag and drives every shaping target, so the policy only sees the
++raw command. Penalties are non-negative costs for negative weights, as in the rest of the MicroDuck task.
++"""
++
++from __future__ import annotations
++
++from collections.abc import Sequence
++from typing import TYPE_CHECKING
++
++import torch
++
++from isaaclab.managers import CommandTerm, CommandTermCfg, SceneEntityCfg
++from isaaclab.utils.configclass import configclass
++from isaaclab.utils.math import quat_from_euler_xyz
++
++from .flamingo import MICRODUCK_FOOT_SITE_OFFSET, foot_site_pos_w, robot_com_pos_w
++from .observations import zero_non_finite
++
++if TYPE_CHECKING:
++    from isaaclab.assets import Articulation
++    from isaaclab.envs import ManagerBasedEnv, ManagerBasedRLEnv
++    from isaaclab.sensors import ContactSensor
++
++
++def _ids(env_ids: Sequence[int] | slice | torch.Tensor | None, num_envs: int, device) -> torch.Tensor:
++    if env_ids is None:
++        env_ids = slice(None)
++    if isinstance(env_ids, slice):
++        return torch.arange(num_envs, device=device)[env_ids]
++    return torch.as_tensor(env_ids, device=device, dtype=torch.long)
++
++
++class FlamingoCommand(CommandTerm):
++    """``[flag, side, 0]`` resampled every dwell time, with a slewed blend ``alpha`` toward the flag.
++
++    The flag is 1 with probability ``flamingo_prob``. The stance side is redrawn only at an episode start or after
++    a two-foot command, so a hold never switches feet; a side requested by the reset event wins. The rewards read the
++    latched ±1 :attr:`stance_side`, while the observed side is zeroed with probability ``zero_side_prob`` during
++    two-foot commands so that the deployed idle command ``[0, 0, 0]`` is trained.
++    """
++
++    cfg: FlamingoCommandCfg
++
++    def __init__(self, cfg: FlamingoCommandCfg, env: ManagerBasedRLEnv):
++        super().__init__(cfg, env)
++        self._command = torch.zeros(self.num_envs, 3, device=self.device)
++        self._alpha = torch.zeros(self.num_envs, device=self.device)
++        self._fresh = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
++        self._pending_side = torch.zeros(self.num_envs, device=self.device)
++        self._stance_side = torch.ones(self.num_envs, device=self.device)
++
++    @property
++    def command(self) -> torch.Tensor:
++        """``[flag, observed side, 0]``, shape ``(num_envs, 3)``."""
++        return self._command
++
++    @property
++    def alpha(self) -> torch.Tensor:
++        """Blend from the two-foot (0) to the one-foot (1) targets, shape ``(num_envs,)``."""
++        return self._alpha
++
++    @property
++    def flag(self) -> torch.Tensor:
++        """Commanded posture: 1 one foot, 0 two feet, shape ``(num_envs,)``."""
++        return self._command[:, 0]
++
++    @property
++    def stance_side(self) -> torch.Tensor:
++        """Latched stance side for the rewards, +1 right or -1 left, shape ``(num_envs,)``."""
++        return self._stance_side
++
++    def set_alpha(self, env_ids: torch.Tensor, value: torch.Tensor) -> None:
++        """Start the blend of environments ``env_ids`` at ``value``, as the reset pose demands."""
++        self._alpha[env_ids] = value
++
++    def request_side(self, env_ids: torch.Tensor, side: torch.Tensor) -> None:
++        """Pin the stance side of environments ``env_ids`` for the resample of the coming command reset."""
++        self._pending_side[env_ids] = side
++        self._stance_side[env_ids] = side
++        self._command[env_ids, 1] = side
++
++    def reset(self, env_ids: Sequence[int] | slice | None = None) -> dict[str, torch.Tensor]:
++        self._fresh[_ids(env_ids, self.num_envs, self.device)] = True
++        return super().reset(env_ids)
++
++    def compute(self, dt: float):
++        super().compute(dt)
++        step = dt / max(self.cfg.ramp_s, 1e-6)
++        self._alpha += torch.clamp(self._command[:, 0] - self._alpha, -step, step)
++
++    def _resample_command(self, env_ids: Sequence[int] | slice):
++        ids = _ids(env_ids, self.num_envs, self.device)
++        n = len(ids)
++        if n == 0:
++            return
++        prev_flag = self._command[ids, 0]
++        new_flag = (torch.rand(n, device=self.device) < self.cfg.flamingo_prob).float()
++        new_side = torch.where(torch.rand(n, device=self.device) < 0.5, -1.0, 1.0)
++        redraw = self._fresh[ids] | (prev_flag < 0.5)
++        side = torch.where(redraw, new_side, self._stance_side[ids])
++        pending = self._pending_side[ids]
++        side = torch.where(pending.abs() > 0.5, pending, side)
++        self._pending_side[ids] = 0.0
++        self._stance_side[ids] = side
++        zero = (new_flag < 0.5) & (torch.rand(n, device=self.device) < self.cfg.zero_side_prob)
++        self._command[ids] = 0.0
++        self._command[ids, 0] = new_flag
++        self._command[ids, 1] = torch.where(zero, torch.zeros_like(side), side)
++        self._fresh[ids] = False
++
++    def _update_command(self):
++        pass
++
++    def _update_metrics(self):
++        pass
++
++
++@configclass
++class FlamingoCommandCfg(CommandTermCfg):
++    """Configuration of :class:`FlamingoCommand`."""
++
++    class_type: type = FlamingoCommand
++    flamingo_prob: float = 0.6
++    """Probability that a resample commands one foot."""
++    ramp_s: float = 1.5
++    """Time [s] for ``alpha`` to cross from 0 to 1."""
++    zero_side_prob: float = 0.5
++    """Probability that the observed side is 0 during a two-foot command."""
++
++
++"""
++Reset.
++"""
++
++
++def reset_flamingo_cycle_pose(
++    env: ManagerBasedEnv,
++    env_ids: torch.Tensor | slice | None,
++    pose_right: Sequence[float],
++    pose_left: Sequence[float],
++    base_roll: float,
++    base_pitch: float,
++    z_range: tuple[float, float],
++    standing_z_range: tuple[float, float],
++    command_name: str,
++    in_pose_prob: float,
++    xy_range: float = 0.0,
++    tilt_noise: float = 0.0,
++    joint_noise_std: float = 0.0,
++    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
++) -> None:
++    """Place environments in the one-foot pose of a random side with ``in_pose_prob``, else standing at HOME.
++
++    As microduck_rl's ``set_flamingo_cycle_state``: the side is pinned into command ``command_name`` and its blend
++    starts at 1 in the pose or 0 standing. In the pose the trunk rolls ``side * base_roll`` and pitches ``base_pitch``
++    [rad] with uniform ``tilt_noise`` [rad] at a height from ``z_range`` [m]; standing it is level at a height from
++    ``standing_z_range`` [m]. Joints ``asset_cfg`` get Gaussian noise of ``joint_noise_std`` [rad] in both buckets.
++    """
++    asset: Articulation = env.scene[asset_cfg.name]
++    ids = _ids(env_ids, env.num_envs, env.device)
++    n = len(ids)
++    if n == 0:
++        return
++    term: FlamingoCommand = env.command_manager.get_term(command_name)
++
++    def uniform(low: float, high: float) -> torch.Tensor:
++        return torch.empty(n, device=env.device).uniform_(low, high)
++
++    side = torch.where(torch.rand(n, device=env.device) < 0.5, -1.0, 1.0)
++    term.request_side(ids, side)
++    in_pose = torch.rand(n, device=env.device) < in_pose_prob
++
++    roll = torch.where(in_pose, side * base_roll + uniform(-tilt_noise, tilt_noise), torch.zeros(n, device=env.device))
++    pitch = torch.where(in_pose, base_pitch + uniform(-tilt_noise, tilt_noise), torch.zeros(n, device=env.device))
++    yaw = uniform(-torch.pi, torch.pi)
++    root = torch.zeros(n, 7, device=env.device)
++    root[:, :3] = env.scene.env_origins[ids]
++    root[:, 0] += uniform(-xy_range, xy_range)
++    root[:, 1] += uniform(-xy_range, xy_range)
++    root[:, 2] += torch.where(in_pose, uniform(*z_range), uniform(*standing_z_range))
++    root[:, 3:] = quat_from_euler_xyz(roll, pitch, yaw)
++    asset.write_root_pose_to_sim_index(root_pose=root, env_ids=ids)
++    asset.write_root_velocity_to_sim_index(root_velocity=torch.zeros(n, 6, device=env.device), env_ids=ids)
++
++    joint_pos = asset.data.default_joint_pos.torch[ids].clone()
++    home = joint_pos[:, asset_cfg.joint_ids]
++    right = torch.tensor(pose_right, device=env.device, dtype=joint_pos.dtype).expand(n, -1)
++    left = torch.tensor(pose_left, device=env.device, dtype=joint_pos.dtype).expand(n, -1)
++    pose = torch.where(in_pose.unsqueeze(1), torch.where((side > 0).unsqueeze(1), right, left), home)
++    joint_pos[:, asset_cfg.joint_ids] = pose + joint_noise_std * torch.randn_like(pose)
++    asset.write_joint_state_to_sim_index(position=joint_pos, velocity=torch.zeros_like(joint_pos), env_ids=ids)
++    term.set_alpha(ids, in_pose.float())
++
++
++"""
++Rewards. ``feet_sensor_cfg`` and ``feet_cfg`` select the ankles in the order [left, right].
++"""
++
++
++def _smoothstep(x: torch.Tensor, lo: float, hi: float) -> torch.Tensor:
++    t = torch.clamp((x - lo) / max(hi - lo, 1e-6), 0.0, 1.0)
++    return t * t * (3.0 - 2.0 * t)
++
++
++def _context(env: ManagerBasedRLEnv, command_name: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    term: FlamingoCommand = env.command_manager.get_term(command_name)
++    return term.flag, term.stance_side, term.alpha
++
++
++def _stance_swing_contact(
++    env: ManagerBasedRLEnv, feet_sensor_cfg: SceneEntityCfg, side: torch.Tensor
++) -> tuple[torch.Tensor, torch.Tensor]:
++    sensor: ContactSensor = env.scene.sensors[feet_sensor_cfg.name]
++    contact = (zero_non_finite(sensor.data.current_contact_time.torch[:, feet_sensor_cfg.body_ids]) > 0.0).float()
++    left, right = contact[:, 0], contact[:, 1]
++    right_stance = side > 0
++    return torch.where(right_stance, right, left), torch.where(right_stance, left, right)
++
++
++def _feet_sites(
++    env: ManagerBasedRLEnv, feet_cfg: SceneEntityCfg, site_offset: tuple[float, float, float]
++) -> tuple[Articulation, torch.Tensor, torch.Tensor]:
++    asset: Articulation = env.scene[feet_cfg.name]
++    sites = zero_non_finite(foot_site_pos_w(asset, feet_cfg.body_ids, site_offset))
++    return asset, sites[:, 0], sites[:, 1]
++
++
++def cycle_com_target(
++    env: ManagerBasedRLEnv,
++    command_name: str,
++    feet_cfg: SceneEntityCfg,
++    std: float,
++    site_offset: tuple[float, float, float] = MICRODUCK_FOOT_SITE_OFFSET,
++) -> torch.Tensor:
++    """Gaussian of the whole-robot CoM against ``(1 - alpha)`` times the feet midpoint plus ``alpha`` times the stance
++    foot, horizontally: the weight shift leads the transition."""
++    _, side, alpha = _context(env, command_name)
++    asset, left, right = _feet_sites(env, feet_cfg, site_offset)
++    stance = torch.where((side > 0).unsqueeze(1), right, left)
++    a = alpha.unsqueeze(1)
++    target = (1.0 - a) * 0.5 * (left + right)[:, :2] + a * stance[:, :2]
++    dist2 = torch.nan_to_num(((robot_com_pos_w(asset)[:, :2] - target) ** 2).sum(dim=-1), nan=1.0)
++    return torch.exp(-dist2 / std**2)
++
++
++def cycle_stance_foot_grounded(
++    env: ManagerBasedRLEnv, command_name: str, feet_sensor_cfg: SceneEntityCfg
++) -> torch.Tensor:
++    """1 while the stance foot touches the ground, in both postures."""
++    _, side, _ = _context(env, command_name)
++    return _stance_swing_contact(env, feet_sensor_cfg, side)[0]
++
++
++def cycle_swing_foot_contact(
++    env: ManagerBasedRLEnv, command_name: str, feet_sensor_cfg: SceneEntityCfg, lo: float, hi: float
++) -> torch.Tensor:
++    """Swing-foot contact: +1 while standing is due (``alpha <= lo``), -1 once the lift is due (``alpha >= hi``)."""
++    _, side, alpha = _context(env, command_name)
++    swing = _stance_swing_contact(env, feet_sensor_cfg, side)[1]
++    return swing * (1.0 - 2.0 * _smoothstep(alpha, lo, hi))
++
++
++def cycle_swing_foot_clear(
++    env: ManagerBasedRLEnv,
++    command_name: str,
++    feet_cfg: SceneEntityCfg,
++    feet_sensor_cfg: SceneEntityCfg,
++    target: float,
++    std: float,
++    lo: float,
++    hi: float,
++    site_offset: tuple[float, float, float] = MICRODUCK_FOOT_SITE_OFFSET,
++) -> torch.Tensor:
++    """Gaussian of the swing-foot site height [m] above the env origin around ``target``, while the stance foot is
++    down and as the lift becomes due."""
++    _, side, alpha = _context(env, command_name)
++    _, left, right = _feet_sites(env, feet_cfg, site_offset)
++    swing = torch.where((side > 0).unsqueeze(1), left, right)
++    z = swing[:, 2] - env.scene.env_origins[:, 2]
++    stance = _stance_swing_contact(env, feet_sensor_cfg, side)[0]
++    return torch.exp(-(((z - target) / std) ** 2)) * stance * _smoothstep(alpha, lo, hi)
++
++
++def cycle_pose_track(
++    env: ManagerBasedRLEnv,
++    command_name: str,
++    pose_right: Sequence[float],
++    pose_left: Sequence[float],
++    std: float,
++    mid_attenuation: float,
++    asset_cfg: SceneEntityCfg,
++) -> torch.Tensor:
++    """Mean per-joint Gaussian against ``(1 - alpha)`` HOME plus ``alpha`` times the side's one-foot pose, faded by
++    ``mid_attenuation`` mid-transition where the CoM term leads."""
++    _, side, alpha = _context(env, command_name)
++    asset: Articulation = env.scene[asset_cfg.name]
++    home = asset.data.default_joint_pos.torch[:, asset_cfg.joint_ids]
++    right = torch.tensor(pose_right, device=home.device, dtype=home.dtype)
++    left = torch.tensor(pose_left, device=home.device, dtype=home.dtype)
++    a = alpha.unsqueeze(1)
++    target = (1.0 - a) * home + a * torch.where((side > 0).unsqueeze(1), right, left)
++    joint_pos = zero_non_finite(asset.data.joint_pos.torch[:, asset_cfg.joint_ids])
++    match = torch.exp(-(((joint_pos - target) / std) ** 2)).mean(dim=-1)
++    return match * (1.0 - mid_attenuation * 4.0 * alpha * (1.0 - alpha))
++
++
++def cycle_gravity_track(
++    env: ManagerBasedRLEnv,
++    command_name: str,
++    gravity_right: tuple[float, float, float],
++    std: float,
++    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
++) -> torch.Tensor:
++    """Gaussian of the trunk-frame gravity against the normalized blend of upright and the side's lean; the left lean
++    mirrors ``gravity_right`` in y."""
++    _, side, alpha = _context(env, command_name)
++    asset: Articulation = env.scene[asset_cfg.name]
++    gravity = zero_non_finite(asset.data.projected_gravity_b.torch)
++    lean = torch.tensor(gravity_right, device=gravity.device, dtype=gravity.dtype).expand_as(gravity).clone()
++    lean[:, 1] *= side
++    up = torch.tensor([0.0, 0.0, -1.0], device=gravity.device, dtype=gravity.dtype)
++    a = alpha.unsqueeze(1)
++    target = (1.0 - a) * up + a * lean
++    target = target / target.norm(dim=-1, keepdim=True).clamp(min=1e-6)
++    return torch.exp(-((gravity - target) ** 2).sum(dim=-1) / std**2)
++
++
++def cycle_stillness(
++    env: ManagerBasedRLEnv,
++    command_name: str,
++    feet_sensor_cfg: SceneEntityCfg,
++    std: float,
++    asset_cfg: SceneEntityCfg,
++) -> torch.Tensor:
++    """Gaussian of the mean squared joint speed, paid once the blend has reached the flag and the stance foot is
++    down: quiet rests in both postures, nothing mid-transition."""
++    flag, side, alpha = _context(env, command_name)
++    asset: Articulation = env.scene[asset_cfg.name]
++    joint_vel = zero_non_finite(asset.data.joint_vel.torch[:, asset_cfg.joint_ids])
++    reward = torch.exp(-(joint_vel**2).mean(dim=-1) / std**2)
++    ramp_done = ((flag - alpha).abs() < 0.02).float()
++    return reward * ramp_done * _stance_swing_contact(env, feet_sensor_cfg, side)[0]
++
++
++def cycle_stance_side_tilt_cost(
++    env: ManagerBasedRLEnv, command_name: str, threshold: float, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
++) -> torch.Tensor:
++    """Squared roll past ``threshold`` (in ``|g_b,y|``) toward the stance side, mirrored by the side."""
++    _, side, _ = _context(env, command_name)
++    asset: Articulation = env.scene[asset_cfg.name]
++    gravity_y = zero_non_finite(asset.data.projected_gravity_b.torch[:, 1])
++    return torch.clamp(-side * gravity_y - threshold, min=0.0) ** 2
++
++
++def cycle_single_support_success(
++    env: ManagerBasedRLEnv, command_name: str, feet_sensor_cfg: SceneEntityCfg
++) -> torch.Tensor:
++    """Logged indicator: 1 when the commanded posture holds, one foot down and the other up or both down."""
++    flag, side, _ = _context(env, command_name)
++    stance, swing = _stance_swing_contact(env, feet_sensor_cfg, side)
++    return torch.where(flag > 0.5, stance * (1.0 - swing), stance * swing)
+diff --git a/source/isaaclab_tasks/test/test_microduck_flamingo_cycle.py b/source/isaaclab_tasks/test/test_microduck_flamingo_cycle.py
+new file mode 100644
+index 000000000..e41eb0427
+--- /dev/null
++++ b/source/isaaclab_tasks/test/test_microduck_flamingo_cycle.py
+@@ -0,0 +1,296 @@
++# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
++# All rights reserved.
++#
++# SPDX-License-Identifier: BSD-3-Clause
++
++"""MicroDuck flamingo cycle, microduck_rl's stage 2 (``Mjlab-FlamingoCycle-Flat-MicroDuck``) on Newton MJWarp.
++
++The command and reward behaviour follows ``FlamingoCommand`` and the ``fl_*`` terms of microduck_rl's
++``src/mjlab_microduck/tasks/mdp.py`` (``flamingo`` branch, ``4757d6ae``); the environment tests check the settings of
++``microduck_flamingo_cycle_env_cfg.py``.
++"""
++
++from types import SimpleNamespace
++
++import gymnasium as gym
++import pytest
++import torch
++
++import isaaclab.sim as sim_utils
++from isaaclab.managers import SceneEntityCfg
++from isaaclab.sim import SimulationContext
++from isaaclab.test.utils import DeviceScope, test_devices
++
++import isaaclab_tasks  # noqa: F401
++from isaaclab_tasks.contrib.microduck import mdp
++from isaaclab_tasks.contrib.microduck.flamingo_pose import FLAMINGO_GRAVITY_B, FLAMINGO_POSE_LEFT, FLAMINGO_POSE_RIGHT
++from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
++
++from isaaclab_assets.robots.microduck import MICRODUCK_JOINT_NAMES
++
++CYCLE_TASK = "IsaacContrib-FlamingoCycle-Flat-MicroDuck"
++
++
++def _command(num_envs=4, flamingo_prob=0.6, ramp_s=1.5, zero_side_prob=0.5):
++    cfg = mdp.FlamingoCommandCfg(
++        resampling_time_range=(2.5, 5.0), flamingo_prob=flamingo_prob, ramp_s=ramp_s, zero_side_prob=zero_side_prob
++    )
++    return mdp.FlamingoCommand(cfg, SimpleNamespace(num_envs=num_envs, device="cpu"))
++
++
++def test_alpha_slews_toward_the_flag_over_the_ramp_time():
++    term = _command(num_envs=1, flamingo_prob=1.0)
++    term.reset()
++    assert term.flag.item() == 1.0
++    term.time_left[:] = 100.0
++    # 0.6 s of a 1.5 s ramp.
++    for _ in range(30):
++        term.compute(0.02)
++    assert term.alpha.item() == pytest.approx(0.4, abs=1e-5)
++    for _ in range(100):
++        term.compute(0.02)
++    assert term.alpha.item() == pytest.approx(1.0)
++
++
++def test_the_stance_side_is_latched_during_a_hold_and_redrawn_only_from_stand():
++    torch.manual_seed(0)
++    term = _command(num_envs=256, flamingo_prob=1.0)
++    term.reset()
++    first = term.stance_side.clone()
++    # Every resample after a one-foot command keeps the side: no side flip mid-hold.
++    for _ in range(5):
++        term._resample(slice(None))
++        torch.testing.assert_close(term.stance_side, first)
++    assert set(first.unique().tolist()) == {-1.0, 1.0}
++
++
++def test_the_observed_side_is_zeroed_only_while_standing():
++    torch.manual_seed(0)
++    term = _command(num_envs=2048, flamingo_prob=0.5, zero_side_prob=0.5)
++    term.reset()
++    flag, side = term.command[:, 0], term.command[:, 1]
++    assert (side[flag > 0.5].abs() == 1.0).all()
++    zeroed = (side[flag < 0.5] == 0.0).float().mean().item()
++    assert zeroed == pytest.approx(0.5, abs=0.06)
++    assert (term.stance_side.abs() == 1.0).all()
++    assert (term.command[:, 2] == 0.0).all()
++
++
++def test_a_side_requested_by_the_spawn_survives_the_reset_resample():
++    term = _command(num_envs=4)
++    ids = torch.arange(4)
++    term.request_side(ids, torch.tensor([1.0, -1.0, 1.0, -1.0]))
++    term.reset(ids)
++    torch.testing.assert_close(term.stance_side, torch.tensor([1.0, -1.0, 1.0, -1.0]))
++
++
++"""
++Rewards on a fake environment: two envs, columns [left, right] for feet.
++"""
++
++
++def _fake_env(alpha, side, flag=None, contact=None, feet_z=None, joint_vel=None, gravity=None):
++    n = len(alpha)
++    term = SimpleNamespace(
++        alpha=torch.tensor(alpha),
++        stance_side=torch.tensor(side),
++        flag=torch.tensor(flag if flag is not None else alpha),
++    )
++    command_manager = SimpleNamespace(get_term=lambda name: term)
++    contact_time = torch.tensor(contact if contact is not None else [[0.1, 0.1]] * n)
++    sensor = SimpleNamespace(data=SimpleNamespace(current_contact_time=SimpleNamespace(torch=contact_time)))
++    pos = torch.zeros(n, 2, 3)
++    if feet_z is not None:
++        pos[:, :, 2] = torch.tensor(feet_z)
++    quat = torch.zeros(n, 2, 4)
++    quat[..., 3] = 1.0
++    data = {
++        "body_link_pos_w": pos,
++        "body_link_quat_w": quat,
++        "joint_vel": torch.tensor(joint_vel if joint_vel is not None else [[0.0, 0.0]] * n),
++        "projected_gravity_b": torch.tensor(gravity if gravity is not None else [[0.0, 0.0, -1.0]] * n),
++    }
++    robot = SimpleNamespace(data=SimpleNamespace(**{k: SimpleNamespace(torch=v) for k, v in data.items()}))
++
++    class Scene(dict):
++        sensors = {"contact_forces": sensor}
++        env_origins = torch.zeros(n, 3)
++
++    return SimpleNamespace(scene=Scene(robot=robot), command_manager=command_manager, device="cpu", num_envs=n)
++
++
++_FEET_SENSOR = SceneEntityCfg("contact_forces", body_ids=[0, 1])
++_FEET_BODIES = SceneEntityCfg("robot", body_ids=[0, 1], joint_ids=[0, 1])
++
++
++def test_swing_foot_contact_is_paid_while_standing_and_taxed_on_one_foot():
++    # Both feet down; alpha 0 (stand), 0.65 (mid), 1 (one foot); right stance.
++    env = _fake_env(alpha=[0.0, 0.65, 1.0], side=[1.0, 1.0, 1.0], contact=[[0.1, 0.1]] * 3)
++    reward = mdp.cycle_swing_foot_contact(env, "base_velocity", _FEET_SENSOR, lo=0.4, hi=0.9)
++    torch.testing.assert_close(reward, torch.tensor([1.0, 0.0, -1.0]))
++
++
++def test_swing_foot_clear_follows_the_side_and_waits_for_the_lift():
++    # Left foot at 0.10 m for right stance, right foot at 0.10 m for left stance; the lift is due only at alpha 1.
++    env = _fake_env(alpha=[1.0, 1.0, 0.3], side=[1.0, -1.0, 1.0], feet_z=[[0.10, 0.0], [0.0, 0.10], [0.10, 0.0]])
++    offset = (0.0, 0.0, 0.0)
++    reward = mdp.cycle_swing_foot_clear(
++        env, "base_velocity", _FEET_BODIES, _FEET_SENSOR, target=0.10, std=0.06, lo=0.6, hi=1.0, site_offset=offset
++    )
++    torch.testing.assert_close(reward, torch.tensor([1.0, 1.0, 0.0]))
++
++
++def test_stillness_waits_for_the_ramp_to_finish():
++    env = _fake_env(alpha=[1.0, 0.5], side=[1.0, 1.0], flag=[1.0, 1.0])
++    reward = mdp.cycle_stillness(env, "base_velocity", _FEET_SENSOR, std=2.0, asset_cfg=_FEET_BODIES)
++    torch.testing.assert_close(reward, torch.tensor([1.0, 0.0]))
++
++
++def test_gravity_target_blends_upright_into_the_side_lean():
++    g_right = torch.tensor(FLAMINGO_GRAVITY_B)
++    g_left = g_right * torch.tensor([1.0, -1.0, 1.0])
++    env = _fake_env(
++        alpha=[0.0, 1.0, 1.0], side=[1.0, 1.0, -1.0], gravity=[[0.0, 0.0, -1.0], g_right.tolist(), g_left.tolist()]
++    )
++    reward = mdp.cycle_gravity_track(env, "base_velocity", FLAMINGO_GRAVITY_B, std=0.15)
++    torch.testing.assert_close(reward, torch.ones(3))
++
++
++def test_stance_side_tilt_is_mirrored_by_the_side():
++    # Rolled 0.2 past the threshold toward the stance side for each side, and toward the swing side.
++    env = _fake_env(
++        alpha=[1.0, 1.0, 1.0], side=[1.0, -1.0, 1.0], gravity=[[0, -0.65, -0.7], [0, 0.65, -0.7], [0, 0.65, -0.7]]
++    )
++    cost = mdp.cycle_stance_side_tilt_cost(env, "base_velocity", threshold=0.45)
++    torch.testing.assert_close(cost, torch.tensor([0.04, 0.04, 0.0]))
++
++
++"""
++Environment.
++"""
++
++
++@pytest.fixture(scope="module")
++def cycle_env():
++    device = test_devices(DeviceScope.CUDA)[0]
++    cfg = parse_env_cfg(CYCLE_TASK, device=device, num_envs=64)
++    sim_utils.create_new_stage()
++    env = gym.make(CYCLE_TASK, cfg=cfg).unwrapped
++    env.reset()
++    yield env
++    env.close()
++    SimulationContext.clear_instance()
++
++
++@pytest.mark.integration
++@pytest.mark.kitless
++def test_cycle_keeps_the_deployed_interface(cycle_env):
++    env = cycle_env
++    assert env.observation_manager.group_obs_dim["policy"] == (61,)
++    assert env.action_manager.total_action_dim == 14
++    assert isinstance(env.command_manager.get_term("base_velocity"), mdp.FlamingoCommand)
++    assert env.max_episode_length_s == pytest.approx(10.0)
++
++
++@pytest.mark.integration
++@pytest.mark.kitless
++def test_cycle_rewards_match_microduck_rl(cycle_env):
++    expected = {
++        "com_target": 3.0,
++        "stance_foot_grounded": 1.0,
++        "swing_foot_contact": 0.5,
++        "swing_foot_clear": 1.5,
++        "pose_track": 1.5,
++        "gravity_track": 2.0,
++        "stillness": 1.0,
++        "stance_side_tilt": -4.0,
++        "commanded_support": 1e-3,
++        "joint_limit_proximity": -1.0,
++        "action_rate_l2": -0.1,
++        "joint_torque_rate_l2": 0.0,
++        "body_ang_vel": -0.05,
++        "angular_momentum": -0.02,
++        "self_collisions": -1.0,
++    }
++    manager = cycle_env.reward_manager
++    weights = {name: manager.get_term_cfg(name).weight for name in manager.active_terms}
++    assert weights == pytest.approx(expected)
++
++
++@pytest.mark.integration
++@pytest.mark.kitless
++def test_cycle_spawn_matches_the_command_side_and_alpha(cycle_env):
++    env = cycle_env
++    env.reset()
++    term = env.command_manager.get_term("base_velocity")
++    robot = env.scene["robot"]
++    joint_ids = robot.find_joints(MICRODUCK_JOINT_NAMES, preserve_order=True)[0]
++    q = robot.data.joint_pos.torch[:, joint_ids]
++    home = robot.data.default_joint_pos.torch[:, joint_ids]
++    poses = {
++        1.0: torch.tensor(FLAMINGO_POSE_RIGHT, device=env.device),
++        -1.0: torch.tensor(FLAMINGO_POSE_LEFT, device=env.device),
++    }
++    for i in range(env.num_envs):
++        target = poses[term.stance_side[i].item()] if term.alpha[i] > 0.5 else home[i]
++        assert (q[i] - target).abs().mean().item() < 0.15
++    # In-pose spawns lean over the stance foot.
++    gy = robot.data.projected_gravity_b.torch[:, 1]
++    in_pose = term.alpha > 0.5
++    assert (torch.sign(gy[in_pose]) == -term.stance_side[in_pose]).all()
++    assert set(term.alpha.unique().tolist()) <= {0.0, 1.0}
++
++
++@pytest.mark.integration
++@pytest.mark.kitless
++def test_cycle_steps_with_finite_rewards(cycle_env):
++    env = cycle_env
++    env.reset()
++    actions = torch.zeros(env.num_envs, 14, device=env.device)
++    for _ in range(10):
++        _, reward, *_ = env.step(actions)
++        assert torch.isfinite(reward).all()
++
++
++@pytest.mark.integration
++@pytest.mark.kitless
++def test_cycle_curriculum_reaches_the_final_microduck_rl_stages(cycle_env):
++    env = cycle_env
++    saved = env.common_step_counter
++    try:
++        env.common_step_counter = 1500 * 24
++        env.curriculum_manager.compute(env_ids=torch.arange(env.num_envs, device=env.device))
++        push = env.event_manager.get_term_cfg("push_robot").params["velocity_range"]
++        assert push == {"x": (-0.15, 0.15), "y": (-0.15, 0.15)}
++        assert env.reward_manager.get_term_cfg("action_rate_l2").weight == -0.5
++        assert env.reward_manager.get_term_cfg("joint_torque_rate_l2").weight == -1e-3
++        assert env.reward_manager.get_term_cfg("com_target").params["std"] == 0.02
++        assert env.event_manager.get_term_cfg("reset_flamingo_cycle_pose").params["in_pose_prob"] == 0.3
++    finally:
++        env.common_step_counter = saved
++
++
++@pytest.mark.parametrize("play", [False, True])
++def test_cycle_schedules_target_enabled_events(play):
++    cfg = parse_env_cfg(CYCLE_TASK, device="cpu", num_envs=1)
++    if play:
++        cfg.play_mode()
++    for name, term in cfg.curriculum.to_dict().items():
++        if term is None:
++            continue
++        address = term["params"]["address"].split(".")
++        if address[0] == "events":
++            assert getattr(cfg.events, address[1]) is not None, f"curriculum {name} targets disabled {address[1]}"
++
++
++def test_cycle_pose_target_blends_home_into_the_side_pose_and_fades_mid_transition():
++    # Two joints; HOME (0, 0); right pose (1, -1), left pose (-1, 1).
++    env = _fake_env(alpha=[0.0, 1.0, 1.0, 0.5], side=[1.0, 1.0, -1.0, 1.0])
++    joint_pos = torch.tensor([[0.0, 0.0], [1.0, -1.0], [-1.0, 1.0], [0.5, -0.5]])
++    env.scene["robot"].data.joint_pos = SimpleNamespace(torch=joint_pos)
++    env.scene["robot"].data.default_joint_pos = SimpleNamespace(torch=torch.zeros(4, 2))
++    reward = mdp.cycle_pose_track(
++        env, "base_velocity", [1.0, -1.0], [-1.0, 1.0], std=0.5, mid_attenuation=0.75, asset_cfg=_FEET_BODIES
++    )
++    # On target everywhere; mid-transition the match is scaled by 1 - 0.75 * 4 * 0.5 * 0.5 = 0.25.
++    torch.testing.assert_close(reward, torch.tensor([1.0, 1.0, 1.0, 0.25]))
+-- 
+2.43.0
+
